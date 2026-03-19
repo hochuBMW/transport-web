@@ -33,9 +33,9 @@
    pip install -r requirements.txt
    ```
 
-4. Запустите сервер для разработки:
+4. Запустите сервер для backend:
    ```bash
-   uvicorn main:app --reload
+   python main.py
    ```
 
 Сервер бэкенда будет доступен по адресу: http://127.0.0.1:8000
