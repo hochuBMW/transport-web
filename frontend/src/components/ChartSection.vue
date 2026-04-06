@@ -1,63 +1,102 @@
 <script setup>
-import { onMounted, ref, watch, computed } from 'vue'
+import { onMounted, onUnmounted, ref, watch, computed, nextTick } from 'vue'
 import Chart from 'chart.js/auto'
-import 'chartjs-adapter-date-fns'
-import zoomPlugin from 'chartjs-plugin-zoom'
-import { TrendingUp, MapPin, ShieldAlert, Zap, Activity } from 'lucide-vue-next'
+import { TrendingUp, MapPin, ShieldAlert, Zap, Activity, LayoutDashboard, Timer } from 'lucide-vue-next'
+import { rankIntervalsByAvgSpeed } from '../utils/intervalBuckets.js'
 
-Chart.register(zoomPlugin)
+const props = defineProps({
+  data: Object,
+})
 
-const props = defineProps(['data'])
 const chartCanvas = ref(null)
+const chartHost = ref(null)
 let chart = null
+let resizeObserver = null
+const dashboardTab = ref('overview')
 
 const statsItems = computed(() => {
-  if (!props.data) return []
-  const s = props.data.statistics || {}
-  
-  // Decide color for congestion index
-  const ci = props.data.congestion_index || 1
+  const d = props.data
+  if (!d) return []
+  const s = d.statistics || {}
+  const ci = d.congestion_index || 1
   let ciColor = 'text-green-600'
   let ciBg = 'bg-green-50'
-  if (ci >= 4 && ci <= 6) { ciColor = 'text-yellow-600'; ciBg = 'bg-yellow-50' }
-  else if (ci > 6) { ciColor = 'text-red-600'; ciBg = 'bg-red-50' }
-
+  if (ci >= 4 && ci <= 6) {
+    ciColor = 'text-yellow-600'
+    ciBg = 'bg-yellow-50'
+  } else if (ci > 6) {
+    ciColor = 'text-red-600'
+    ciBg = 'bg-red-50'
+  }
   return [
-    { label: 'Ср. скорость', value: (props.data.avg_speed || 0).toFixed(1) + ' км/ч', icon: TrendingUp, color: 'text-blue-600', bg: 'bg-blue-50' },
+    { label: 'Ср. скорость', value: (d.avg_speed || 0).toFixed(1) + ' км/ч', icon: TrendingUp, color: 'text-blue-600', bg: 'bg-blue-50' },
     { label: 'Индекс затора', value: `${ci} / 10`, icon: Activity, color: ciColor, bg: ciBg },
-    { label: 'Зон заторов', value: props.data.congestion_zones?.length || 0, icon: ShieldAlert, color: 'text-red-600', bg: 'bg-red-50' },
-    { label: 'Всего точек', value: props.data.count || 0, icon: MapPin, color: 'text-gray-600', bg: 'bg-gray-100' },
+    { label: 'Зон заторов', value: d.congestion_zones?.length || 0, icon: ShieldAlert, color: 'text-red-600', bg: 'bg-red-50' },
+    { label: 'Всего точек', value: d.count || 0, icon: MapPin, color: 'text-gray-600', bg: 'bg-gray-100' },
     { label: 'Медиана', value: (s.median || 0).toFixed(1) + ' км/ч', icon: Zap, color: 'text-purple-600', bg: 'bg-purple-50' },
   ]
 })
+
+const intervals1h = computed(() =>
+  rankIntervalsByAvgSpeed(props.data?.plot?.raw_times, props.data?.plot?.raw_speeds, 1, 8)
+)
+
+const formatIvLabel = (r) => {
+  const o = { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }
+  const a = new Date(r.startMs).toLocaleString('ru-RU', o)
+  const b = new Date(r.endMs).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+  return `${a} — ${b}`
+}
+
+const pickPlotSeries = () => {
+  const plot = props.data?.plot
+  if (!plot) return { times: [], speeds: [] }
+  let times = Array.from(plot.times || [])
+  let speeds = Array.from(plot.speeds || [])
+  if (!times.length && plot.raw_times?.length) {
+    times = Array.from(plot.raw_times)
+    speeds = Array.from(plot.raw_speeds || [])
+  }
+  return { times, speeds }
+}
 
 const initChart = () => {
   if (!chartCanvas.value) return
   if (chart) chart.destroy()
 
   const ctx = chartCanvas.value.getContext('2d')
-  const gradient = ctx.createLinearGradient(0, 0, 0, 400)
+  const { height } = chartHost.value?.getBoundingClientRect() || { height: 0 }
+  const h = Math.max(height || chartCanvas.value.parentElement?.clientHeight || 240, 120)
+  const gradient = ctx.createLinearGradient(0, 0, 0, h)
   gradient.addColorStop(0, 'rgba(37, 99, 235, 0.2)')
   gradient.addColorStop(1, 'rgba(37, 99, 235, 0)')
 
-  const labels = props.data?.plot?.times?.map(t => new Date(t)) || []
-  const speeds = props.data?.plot?.speeds || []
+  const { times: tA, speeds: sA } = pickPlotSeries()
+  const dataA = tA
+    .map((t, i) => {
+      const ms = new Date(t).getTime()
+      return { x: ms, y: Number(sA[i]) }
+    })
+    .filter((p) => !Number.isNaN(p.x) && Number.isFinite(p.y))
+  dataA.sort((a, b) => a.x - b.x)
 
   chart = new Chart(ctx, {
     type: 'line',
     data: {
-      labels,
-      datasets: [{
-        label: 'Скорость (км/ч)',
-        data: speeds,
-        borderColor: '#2563eb',
-        borderWidth: 2,
-        fill: true,
-        backgroundColor: gradient,
-        tension: 0.4,
-        pointRadius: 0,
-        pointHoverRadius: 6,
-      }]
+      datasets: [
+        {
+          label: 'Скорость (км/ч)',
+          data: dataA,
+          borderColor: '#2563eb',
+          borderWidth: 2,
+          fill: true,
+          backgroundColor: gradient,
+          tension: 0.4,
+          pointRadius: 0,
+          pointHoverRadius: 6,
+          parsing: false,
+        },
+      ],
     },
     options: {
       responsive: true,
@@ -68,14 +107,6 @@ const initChart = () => {
       },
       plugins: {
         legend: { display: false },
-        zoom: {
-          pan: { enabled: true, mode: 'x' },
-          zoom: {
-            wheel: { enabled: true },
-            pinch: { enabled: true },
-            mode: 'x',
-          }
-        },
         tooltip: {
           backgroundColor: 'rgba(255, 255, 255, 0.95)',
           titleColor: '#1f2937',
@@ -88,76 +119,189 @@ const initChart = () => {
           displayColors: false,
           callbacks: {
             title: (items) => {
-              const date = new Date(items[0].parsed.x)
-              return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+              const v = items[0]?.parsed?.x
+              const date = new Date(typeof v === 'number' ? v : v)
+              return Number.isNaN(date.getTime())
+                ? ''
+                : date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
             },
             label: (item) => {
               return `Ср. скорость: ${item.parsed.y.toFixed(1)} км/ч`
-            }
-          }
-        }
+            },
+          },
+        },
       },
       scales: {
         x: {
-          type: 'time',
-          time: { 
-            unit: 'minute',
-            stepSize: 15,
-            displayFormats: {
-              minute: 'HH:mm'
-            }
-          },
+          type: 'linear',
           grid: { display: false },
-          ticks: { color: '#9ca3af', font: { size: 10 } }
+          ticks: {
+            color: '#9ca3af',
+            font: { size: 10 },
+            maxTicksLimit: 8,
+            callback: (v) => {
+              const d = new Date(v)
+              return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+            },
+          },
         },
         y: {
           beginAtZero: true,
           grid: { color: '#f3f4f6' },
-          ticks: { color: '#9ca3af', font: { size: 10 } }
-        }
-      }
-    }
+          ticks: { color: '#9ca3af', font: { size: 10 } },
+        },
+      },
+    },
+  })
+  requestAnimationFrame(() => {
+    chart?.resize()
   })
 }
 
-const resetZoom = () => {
-  if (chart) chart.resetZoom()
+const scheduleInitChart = () => {
+  nextTick(() => initChart())
 }
 
-onMounted(initChart)
-watch(() => props.data, initChart, { deep: true })
+const plotWatchKey = () => {
+  const p = props.data?.plot
+  if (!p) return ''
+  const t = p.times
+  const s = p.speeds
+  const rt = p.raw_times
+  const rs = p.raw_speeds
+  return [
+    t?.length ?? 0,
+    s?.length ?? 0,
+    t?.[0],
+    t?.[(t?.length ?? 1) - 1],
+    rt?.length ?? 0,
+    rs?.length ?? 0,
+  ].join('|')
+}
+
+onMounted(() => {
+  resizeObserver = new ResizeObserver(() => {
+    chart?.resize()
+  })
+  nextTick(() => {
+    if (chartHost.value) resizeObserver.observe(chartHost.value)
+    scheduleInitChart()
+  })
+})
+
+watch(plotWatchKey, scheduleInitChart)
+
+watch(dashboardTab, (tab) => {
+  if (tab !== 'overview') return
+  nextTick(() => {
+    requestAnimationFrame(() => chart?.resize())
+  })
+})
+
+onUnmounted(() => {
+  if (resizeObserver) {
+    resizeObserver.disconnect()
+    resizeObserver = null
+  }
+  if (chart) {
+    chart.destroy()
+    chart = null
+  }
+})
 </script>
 
 <template>
-  <div class="h-full flex flex-col md:flex-row gap-6 overflow-hidden">
-    <!-- Left: Stats Grid -->
-    <div class="md:w-64 grid grid-cols-2 md:grid-cols-1 gap-3 overflow-y-auto custom-scrollbar pr-2 flex-shrink-0">
-      <div 
-        v-for="item in statsItems" 
-        :key="item.label"
-        class="bg-gray-50 border border-gray-100 p-3 rounded-xl flex items-center gap-3 transition-all hover:shadow-md"
+  <div class="h-full flex flex-col min-h-0 gap-3 overflow-hidden">
+    <div class="flex flex-wrap gap-1 border-b border-gray-100 pb-2 flex-shrink-0">
+      <button
+        type="button"
+        :class="[
+          'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors',
+          dashboardTab === 'overview'
+            ? 'bg-primary-600 text-white shadow-sm'
+            : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
+        ]"
+        @click="dashboardTab = 'overview'"
       >
-        <div :class="['p-2 rounded-lg', item.bg]">
-          <component :is="item.icon" :class="['w-4 h-4', item.color]" />
+        <LayoutDashboard class="w-3.5 h-3.5" />
+        Ключевые показатели
+      </button>
+      <button
+        type="button"
+        :class="[
+          'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors',
+          dashboardTab === 'intervals'
+            ? 'bg-primary-600 text-white shadow-sm'
+            : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
+        ]"
+        @click="dashboardTab = 'intervals'"
+      >
+        <Timer class="w-3.5 h-3.5" />
+        Тяжёлые интервалы
+      </button>
+    </div>
+
+    <div v-show="dashboardTab === 'overview'" class="flex-1 min-h-0 flex flex-col md:flex-row gap-6 overflow-hidden">
+      <div class="md:w-[min(22rem,100%)] grid grid-cols-2 md:grid-cols-1 gap-2 overflow-y-auto custom-scrollbar pr-1 flex-shrink-0">
+        <div
+          v-for="item in statsItems"
+          :key="item.label"
+          class="bg-gray-50 border border-gray-100 p-2.5 rounded-xl flex items-center gap-2.5"
+        >
+          <div :class="['p-2 rounded-lg', item.bg]">
+            <component :is="item.icon" :class="['w-4 h-4', item.color]" />
+          </div>
+          <div class="min-w-0">
+            <div class="text-[9px] text-gray-400 font-bold uppercase tracking-tighter truncate">{{ item.label }}</div>
+            <div class="text-sm font-bold text-gray-800">{{ item.value }}</div>
+          </div>
         </div>
-        <div class="min-w-0">
-          <div class="text-[10px] text-gray-400 font-bold uppercase tracking-tighter truncate">{{ item.label }}</div>
-          <div class="text-sm font-bold text-gray-800">{{ item.value }}</div>
+      </div>
+
+      <div class="flex-1 flex flex-col min-w-0 min-h-[200px]">
+        <div class="flex items-center justify-between mb-2 flex-shrink-0">
+          <h3 class="text-xs font-bold text-gray-700">Профиль скорости</h3>
+        </div>
+        <div
+          ref="chartHost"
+          class="relative flex-1 min-h-0 w-full min-h-[12rem] bg-gray-50/50 rounded-xl border border-gray-100 p-2"
+        >
+          <canvas ref="chartCanvas" class="absolute inset-0 block h-full w-full max-h-full"></canvas>
         </div>
       </div>
     </div>
 
-    <!-- Right: Chart Area -->
-    <div class="flex-1 flex flex-col min-w-0">
-      <div class="flex items-center justify-between mb-2">
-        <h3 class="text-xs font-bold text-gray-700 flex items-center gap-2">
-          Профиль скорости
-          <button @click="resetZoom" class="text-[10px] text-primary-600 hover:bg-primary-50 px-2 py-0.5 rounded border border-primary-100 transition-colors">Сброс зума</button>
-        </h3>
-        <span class="text-[9px] text-gray-400 italic hidden sm:inline text-right">Колесико — зум, зажим — перемещение</span>
-      </div>
-      <div class="flex-1 min-h-0 bg-gray-50/50 rounded-xl border border-gray-100 p-2">
-        <canvas ref="chartCanvas"></canvas>
+    <div
+      v-show="dashboardTab === 'intervals'"
+      class="flex-1 min-h-0 overflow-y-auto custom-scrollbar space-y-4 pr-1"
+    >
+      <p class="text-[11px] text-gray-500 leading-snug">
+        Часовые окна с <strong>наименьшей</strong> средней скоростью по сырым точкам ответа (после фильтров анализа).
+      </p>
+
+      <div class="rounded-xl border border-gray-100 overflow-hidden max-w-3xl">
+        <div class="text-[10px] font-bold text-gray-500 uppercase px-3 py-2 bg-gray-50 border-b border-gray-100">
+          Окна 1 час (худшие по ср. скорости)
+        </div>
+        <table v-if="intervals1h.length" class="w-full text-[11px]">
+          <thead>
+            <tr class="text-gray-500 border-b border-gray-100 text-left">
+              <th class="py-1.5 px-2 font-medium">#</th>
+              <th class="py-1.5 px-2 font-medium">Интервал</th>
+              <th class="py-1.5 px-2 font-medium">Ср. км/ч</th>
+              <th class="py-1.5 px-2 font-medium">Точек</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(r, i) in intervals1h" :key="r.startMs" class="border-b border-gray-50">
+              <td class="py-1 px-2 text-gray-400">{{ i + 1 }}</td>
+              <td class="py-1 px-2 text-gray-800">{{ formatIvLabel(r) }}</td>
+              <td class="py-1 px-2 font-semibold text-gray-900">{{ r.avgSpeed.toFixed(1) }}</td>
+              <td class="py-1 px-2 text-gray-600">{{ r.count }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p v-else class="text-xs text-gray-400 p-3">Недостаточно данных для часовых окон.</p>
       </div>
     </div>
   </div>

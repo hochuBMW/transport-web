@@ -1,6 +1,6 @@
 # backend/models.py
 from pydantic import BaseModel, Field, validator
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 class AnalyzeRequest(BaseModel):
     geojson: Dict[str, Any] = Field(..., description="GeoJSON data with features")
@@ -12,9 +12,36 @@ class AnalyzeRequest(BaseModel):
     min_pts: int = Field(4, ge=1, description="Minimum points per cluster")
     return_all_clusters: bool = Field(True, description="Return all congestion clusters, not just the largest")
     routes: Optional[List[str]] = Field(None, description="List of route numbers to filter by")
+    map_matching: bool = Field(False, description="Включить привязку точек к дорожной сети")
+    snap_engine: Literal["osrm", "qgis"] = Field(
+        "osrm",
+        description="osrm — OSRM Match; qgis — привязка к линейному GeoJSON графа (Shapely; USE_QGIS_SNAP=1 — PyQGIS)",
+    )
+    roads_geojson_path: Optional[str] = Field(
+        None,
+        description="Путь к GeoJSON/SHP линий дорог для режима qgis (или env ROADS_GEOJSON_PATH)",
+    )
+    snap_tolerance_m: float = Field(
+        50.0,
+        gt=0,
+        le=500,
+        description="Допуск привязки к дороге, метры (только qgis)",
+    )
+    analysis_geometry: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Optional GeoJSON geometry (Polygon or MultiPolygon, WGS84). Only points inside are analyzed.",
+    )
 
     @validator("geojson")
     def validate_geojson(cls, v):
         if not isinstance(v, dict) or v.get("type") != "FeatureCollection":
             raise ValueError("GeoJSON must be a FeatureCollection")
+        return v
+
+    @validator("analysis_geometry")
+    def validate_analysis_geometry(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, dict) or v.get("type") not in ("Polygon", "MultiPolygon"):
+            raise ValueError("analysis_geometry must be a GeoJSON Polygon or MultiPolygon object")
         return v

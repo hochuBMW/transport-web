@@ -1,4 +1,5 @@
 # backend/main.py
+import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import timedelta
@@ -8,11 +9,12 @@ import logging
 from shapely.geometry import MultiPoint, mapping
 
 from models import AnalyzeRequest
-from utils import parse_time
+from utils import parse_time, point_in_analysis_geometry
 from services import (
-    calculate_statistics, 
-    region_growing_clusters, 
-    aggregate_plot_data
+    calculate_statistics,
+    region_growing_clusters,
+    aggregate_plot_data,
+    snap_features_by_engine,
 )
 
 # Configure logging
@@ -80,8 +82,14 @@ async def analyze(req: AnalyzeRequest):
             if not coords or len(coords) < 2:
                 continue
             
-            lon, lat = coords[0], coords[1]
-            
+            try:
+                lon, lat = float(coords[0]), float(coords[1])
+            except (TypeError, ValueError):
+                continue
+
+            if req.analysis_geometry and not point_in_analysis_geometry(lon, lat, req.analysis_geometry):
+                continue
+
             # Parse time and apply +8 hours offset
             dt = parse_time(str(props.get("time")))
             if dt is None:
@@ -122,6 +130,21 @@ async def analyze(req: AnalyzeRequest):
                 slow_candidates.append([lon, lat])
                 slow_indices.append(idx)
 
+        if req.map_matching and filtered_points:
+            filtered_points = snap_features_by_engine(
+                filtered_points,
+                engine=req.snap_engine,
+                roads_path=req.roads_geojson_path,
+                tolerance_m=req.snap_tolerance_m,
+            )
+            # Rebuild slow candidates with potentially new coordinates
+            slow_candidates = []
+            for i in slow_indices:
+                feat = filtered_points[i]
+                coords = feat.get("geometry", {}).get("coordinates")
+                if coords:
+                    slow_candidates.append(coords)
+
         # Calculate Congestion Index (1-10)
         # Assuming 40 km/h is free flow speed.
         avg_speed = sum(speeds) / len(speeds) if speeds else 0
@@ -140,11 +163,19 @@ async def analyze(req: AnalyzeRequest):
             "congestion_zones": [],
             "plot": {"times": [], "speeds": []},
             "statistics": calculate_statistics(speeds) if speeds else {},
-            "warnings": []
+            "warnings": [],
         }
 
         if fmt_errors:
             result["warnings"].append(f"Could not parse {fmt_errors} time values")
+
+        if req.map_matching and req.snap_engine == "qgis":
+            rpath = (req.roads_geojson_path or os.environ.get("ROADS_GEOJSON_PATH") or "").strip()
+            rpath = os.path.expanduser(rpath)
+            if not rpath or not os.path.isfile(rpath):
+                result["warnings"].append(
+                    "Привязка к графу: не задан или не найден файл дорог (roads_geojson_path или ROADS_GEOJSON_PATH)."
+                )
         
         if not filtered_points:
             result["warnings"].append("No points matching criteria")

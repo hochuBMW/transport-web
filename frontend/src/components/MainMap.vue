@@ -1,16 +1,21 @@
 <script setup>
-import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch, inject } from 'vue'
 import L from 'leaflet'
+import 'leaflet-draw'
+import 'leaflet-draw/dist/leaflet.draw.css'
 import 'leaflet.heat'
 import { Layers } from 'lucide-vue-next'
 
 const props = defineProps(['data', 'height'])
 const mapContainer = ref(null)
 const heatmapMode = ref(false)
+const analysisAreaGeometry = inject('analysisAreaGeometry')
+
 let map = null
 let routeLayer = null
 let congestionLayer = null
 let heatLayer = null
+let drawnItems = null
 
 onMounted(() => {
   map = L.map(mapContainer.value).setView([52.3, 104.3], 11)
@@ -18,6 +23,56 @@ onMounted(() => {
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map)
+
+  drawnItems = new L.FeatureGroup()
+  map.addLayer(drawnItems)
+
+  const drawControl = new L.Control.Draw({
+    position: 'topleft',
+    draw: {
+      polygon: {
+        allowIntersection: false,
+        showArea: false,
+        shapeOptions: {
+          color: '#2563eb',
+          weight: 2,
+          fillColor: '#3b82f6',
+          fillOpacity: 0.15,
+        },
+      },
+      rectangle: false,
+      polyline: false,
+      circle: false,
+      marker: false,
+      circlemarker: false,
+    },
+    edit: {
+      featureGroup: drawnItems,
+      remove: true,
+    },
+  })
+  map.addControl(drawControl)
+
+  const syncGeometryFromLayer = (layer) => {
+    const gj = layer.toGeoJSON()
+    if (gj?.geometry && analysisAreaGeometry) {
+      analysisAreaGeometry.value = gj.geometry
+    }
+  }
+
+  map.on(L.Draw.Event.CREATED, (e) => {
+    drawnItems.clearLayers()
+    drawnItems.addLayer(e.layer)
+    syncGeometryFromLayer(e.layer)
+  })
+
+  map.on(L.Draw.Event.EDITED, (e) => {
+    e.layers.eachLayer((layer) => syncGeometryFromLayer(layer))
+  })
+
+  map.on(L.Draw.Event.DELETED, () => {
+    if (analysisAreaGeometry) analysisAreaGeometry.value = null
+  })
 
   // Wait for parent layout to stabilize
   setTimeout(() => {
@@ -177,12 +232,29 @@ watch(() => props.height, () => {
     map.invalidateSize()
   }
 })
+
+// Сброс фигуры на карте, если область очищена из сайдбара
+watch(
+  () => analysisAreaGeometry?.value,
+  (geom) => {
+    if (geom == null && drawnItems) {
+      drawnItems.clearLayers()
+    }
+  }
+)
 </script>
 
 <template>
   <div class="w-full h-full relative z-10">
     <div ref="mapContainer" class="w-full h-full"></div>
     
+    <div class="absolute top-4 left-14 z-[1000] max-w-[220px] pointer-events-none">
+      <div class="pointer-events-auto bg-white/95 backdrop-blur-sm border border-gray-200 rounded-xl shadow-lg px-3 py-2 text-[11px] text-gray-600 leading-snug">
+        <span class="font-semibold text-gray-800">Область анализа:</span>
+        панель слева — нарисуйте полигон. Редактирование и удаление — там же.
+      </div>
+    </div>
+
     <!-- Controls -->
     <div class="absolute top-4 right-4 z-[1000] flex flex-col gap-2">
       <button 

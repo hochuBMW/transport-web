@@ -3,7 +3,9 @@ import logging
 from math import radians, cos, sin, asin, sqrt
 from datetime import datetime
 from dateutil import parser
-from typing import Optional
+from typing import Any, Dict, Optional
+
+from shapely.geometry import Point, shape
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +21,25 @@ def haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     c = 2 * asin(sqrt(a))
     R = 6371000  # Earth radius in meters
     return R * c
+
+def point_in_analysis_geometry(lon: float, lat: float, geom: Optional[Dict[str, Any]]) -> bool:
+    """
+    True if (lon, lat) lies inside or on the boundary of the given GeoJSON geometry.
+    Supports Polygon and MultiPolygon in WGS84 (same as incoming points).
+    """
+    if not geom:
+        return True
+    gtype = geom.get("type")
+    if gtype not in ("Polygon", "MultiPolygon"):
+        return False
+    try:
+        g = shape(geom)
+        if not g.is_valid:
+            g = g.buffer(0)
+        return bool(g.covers(Point(lon, lat)))
+    except Exception:
+        return False
+
 
 def parse_time(s: str) -> Optional[datetime]:
     """

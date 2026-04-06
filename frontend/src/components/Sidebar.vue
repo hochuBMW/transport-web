@@ -1,15 +1,15 @@
 <script setup>
-import { ref, watch, inject } from 'vue'
+import { ref, inject, computed } from 'vue'
 import axios from 'axios'
-import { ChevronLeft, ChevronRight, Upload, Play, Trash2, Download, Activity } from 'lucide-vue-next'
+import { ChevronLeft, ChevronRight, Upload, Play, Trash2, Download, Activity, Clock } from 'lucide-vue-next'
 
 const props = defineProps(['isOpen'])
 const emit = defineEmits(['toggle', 'analysis-complete'])
 
 const API_URL = "http://127.0.0.1:8000/analyze"
 const isLoading = inject('isLoading')
+const analysisAreaGeometry = inject('analysisAreaGeometry')
 
-// Parameters
 const params = ref({
   start: '',
   end: '',
@@ -17,13 +17,45 @@ const params = ref({
   speed_thresh: 8.0,
   eps_m: 50,
   min_pts: 4,
-  routes: []
+  routes: [],
+  map_matching: false,
+  snap_engine: 'osrm',
+  roads_geojson_path: '',
+  snap_tolerance_m: 50,
 })
 
 const rawGeoJson = ref(null)
 const fileName = ref('')
 const notifications = ref([])
 const availableRoutes = ref([])
+
+/** Границы времени по файлу (после загрузки) */
+const dataTimeBounds = ref(null)
+/** День для слайсера часов (YYYY-MM-DD) */
+const sliceDate = ref('')
+const hourFrom = ref(7)
+const hourTo = ref(10)
+
+const pad2 = (n) => String(n).padStart(2, '0')
+
+const formatLocal = (d) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
+
+const clampToBounds = (a, b) => {
+  if (!dataTimeBounds.value) return { start: formatLocal(a), end: formatLocal(b) }
+  const { min, max } = dataTimeBounds.value
+  const s = new Date(Math.max(a.getTime(), min.getTime()))
+  const e = new Date(Math.min(b.getTime(), max.getTime()))
+  if (s.getTime() >= e.getTime()) return null
+  return { start: formatLocal(s), end: formatLocal(e) }
+}
+
+const sliceDateBounds = computed(() => {
+  if (!dataTimeBounds.value) return { min: '', max: '' }
+  const { min, max } = dataTimeBounds.value
+  const f = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+  return { min: f(min), max: f(max) }
+})
 
 const addNotification = (message, type = 'info') => {
   const id = Date.now()
@@ -63,6 +95,7 @@ const handleFileUpload = async (event) => {
   } catch (e) {
     addNotification(`Ошибка: ${e.message}`, 'error')
     rawGeoJson.value = null
+    dataTimeBounds.value = null
   }
 }
 
@@ -92,17 +125,90 @@ const detectTimeRange = (geojson) => {
   if (times.length > 0) {
     const min = new Date(Math.min(...times))
     const max = new Date(Math.max(...times))
-    
-    const format = (d) => {
-      const pad = (n) => String(n).padStart(2, '0')
-      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
-    }
-    
-    params.value.start = format(min)
-    params.value.end = format(max)
+    dataTimeBounds.value = { min, max }
+    sliceDate.value = `${min.getFullYear()}-${pad2(min.getMonth() + 1)}-${pad2(min.getDate())}`
+    hourFrom.value = 7
+    hourTo.value = 10
+
+    params.value.start = formatLocal(min)
+    params.value.end = formatLocal(max)
     addNotification(`Период определен: ${min.toLocaleDateString()} - ${max.toLocaleDateString()}`, "info")
+  } else {
+    dataTimeBounds.value = null
   }
 }
+
+const applyPreset = (id) => {
+  if (!dataTimeBounds.value) {
+    addNotification('Сначала загрузите файл с метками времени', 'warning')
+    return
+  }
+  const { min, max } = dataTimeBounds.value
+  const D = new Date(min.getFullYear(), min.getMonth(), min.getDate(), 0, 0, 0, 0)
+
+  const slot = (h0, h1) => {
+    const startSlot = new Date(D.getFullYear(), D.getMonth(), D.getDate(), h0, 0, 0, 0)
+    const endSlot = new Date(D.getFullYear(), D.getMonth(), D.getDate(), h1, 59, 59, 999)
+    return clampToBounds(startSlot, endSlot)
+  }
+
+  let r = null
+  if (id === 'full') {
+    r = { start: formatLocal(min), end: formatLocal(max) }
+  } else if (id === 'morning') r = slot(6, 10)
+  else if (id === 'day') r = slot(10, 16)
+  else if (id === 'evening') r = slot(16, 22)
+  else if (id === 'peak_am') r = slot(7, 9)
+  else if (id === 'peak_pm') r = slot(17, 19)
+  else if (id === 'last2h') {
+    const e = max
+    const s = new Date(e.getTime() - 2 * 3600000)
+    r = clampToBounds(s, e)
+  } else if (id === 'last4h') {
+    const e = max
+    const s = new Date(e.getTime() - 4 * 3600000)
+    r = clampToBounds(s, e)
+  }
+
+  if (!r) {
+    addNotification('Пресет не пересекается с данными файла', 'warning')
+    return
+  }
+  params.value.start = r.start
+  params.value.end = r.end
+  addNotification('Период обновлён по пресету', 'info')
+}
+
+const applyHourSlice = () => {
+  const d = sliceDate.value
+  if (!d) return
+  const h0 = Math.min(hourFrom.value, hourTo.value)
+  const h1 = Math.max(hourFrom.value, hourTo.value)
+  const startSlot = new Date(`${d}T${pad2(h0)}:00`)
+  const endSlot = new Date(`${d}T${pad2(h1)}:59`)
+  const r = clampToBounds(startSlot, endSlot)
+  if (!r) {
+    addNotification('Выбранные часы не пересекаются с данными файла', 'warning')
+    return
+  }
+  params.value.start = r.start
+  params.value.end = r.end
+  addNotification('Период обновлён по часам', 'info')
+}
+
+const buildPayload = () => ({
+  geojson: rawGeoJson.value,
+  include_zero: params.value.include_zero,
+  speed_thresh: params.value.speed_thresh,
+  eps_m: params.value.eps_m,
+  min_pts: params.value.min_pts,
+  routes: params.value.routes.length > 0 ? params.value.routes : null,
+  map_matching: params.value.map_matching,
+  snap_engine: params.value.map_matching ? params.value.snap_engine : 'osrm',
+  roads_geojson_path: params.value.roads_geojson_path?.trim() || null,
+  snap_tolerance_m: params.value.snap_tolerance_m,
+  analysis_geometry: analysisAreaGeometry?.value || null,
+})
 
 const runAnalysis = async () => {
   if (!rawGeoJson.value) {
@@ -110,22 +216,20 @@ const runAnalysis = async () => {
     return
   }
 
+  if (!params.value.start || !params.value.end) {
+    addNotification('Задайте начало и конец периода', 'warning')
+    return
+  }
+
   isLoading.value = true
   try {
-    const payload = {
-      geojson: rawGeoJson.value,
+    const res = await axios.post(API_URL, {
+      ...buildPayload(),
       start: params.value.start.replace('T', ' '),
       end: params.value.end.replace('T', ' '),
-      include_zero: params.value.include_zero,
-      speed_thresh: params.value.speed_thresh,
-      eps_m: params.value.eps_m,
-      min_pts: params.value.min_pts,
-      routes: params.value.routes.length > 0 ? params.value.routes : null
-    }
-
-    const res = await axios.post(API_URL, payload)
+    })
     emit('analysis-complete', res.data)
-    addNotification("Анализ завершен успешно", "success")
+    addNotification('Анализ завершён', 'success')
   } catch (e) {
     const msg = e.response?.data?.detail || e.message
     addNotification(`Ошибка анализа: ${msg}`, "error")
@@ -139,8 +243,15 @@ const clearData = () => {
   fileName.value = ''
   availableRoutes.value = []
   params.value.routes = []
+  dataTimeBounds.value = null
+  if (analysisAreaGeometry) analysisAreaGeometry.value = null
   emit('analysis-complete', null)
   addNotification("Данные очищены", "info")
+}
+
+const clearAnalysisAreaOnly = () => {
+  if (analysisAreaGeometry) analysisAreaGeometry.value = null
+  addNotification("Область анализа снята", "info")
 }
 
 const exportPdf = () => {
@@ -201,6 +312,28 @@ const exportPdf = () => {
         </label>
       </div>
 
+      <!-- Section: Map AOI -->
+      <div class="space-y-2 pt-2 border-t border-gray-100">
+        <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Область на карте</h2>
+        <p class="text-[11px] text-gray-500 leading-snug">
+          На карте слева: инструмент <strong>полигон</strong>. После выделения анализ учитывает только точки внутри области.
+        </p>
+        <div
+          v-if="analysisAreaGeometry?.value"
+          class="flex items-center justify-between gap-2 p-2 rounded-lg bg-primary-50 border border-primary-100"
+        >
+          <span class="text-xs text-primary-800 font-medium">Область задана</span>
+          <button
+            type="button"
+            @click="clearAnalysisAreaOnly"
+            class="text-[11px] font-semibold text-primary-700 hover:text-primary-900 underline shrink-0"
+          >
+            Снять
+          </button>
+        </div>
+        <p v-else class="text-[11px] text-gray-400 italic">Без выделения — по всему файлу</p>
+      </div>
+
       <!-- Section: Analysis Parameters -->
       <div class="space-y-4 pt-4 border-t border-gray-100">
         <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Параметры анализа</h2>
@@ -224,6 +357,46 @@ const exportPdf = () => {
           </div>
         </div>
 
+        <div v-if="dataTimeBounds" class="space-y-2 pt-2 border-t border-gray-100">
+          <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+            <Clock class="w-3.5 h-3.5" /> Быстрый выбор
+          </h2>
+          <div class="flex flex-wrap gap-1">
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('full')">Весь период</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('morning')">6–10</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('day')">10–16</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('evening')">16–22</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('peak_am')">Пик утро</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('peak_pm')">Пик вечер</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('last2h')">−2 ч</button>
+            <button type="button" class="px-2 py-1 text-[10px] font-medium rounded-md bg-gray-100 hover:bg-primary-100 text-gray-700 border border-gray-200" @click="applyPreset('last4h')">−4 ч</button>
+          </div>
+          <div class="space-y-2 rounded-lg border border-gray-100 bg-gray-50/80 p-2">
+            <div class="text-[10px] font-semibold text-gray-600">Слайдер по часам (1-й день в данных)</div>
+            <input
+              type="date"
+              v-model="sliceDate"
+              :min="sliceDateBounds.min"
+              :max="sliceDateBounds.max"
+              class="w-full text-xs p-1.5 border rounded-md bg-white"
+            />
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-gray-500 w-6 shrink-0">С</span>
+              <input v-model.number="hourFrom" type="range" min="0" max="23" class="flex-1 h-1.5 accent-primary-600" />
+              <span class="text-[11px] font-mono w-6 text-right">{{ hourFrom }}</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-[10px] text-gray-500 w-6 shrink-0">По</span>
+              <input v-model.number="hourTo" type="range" min="0" max="23" class="flex-1 h-1.5 accent-primary-600" />
+              <span class="text-[11px] font-mono w-6 text-right">{{ hourTo }}</span>
+            </div>
+            <button type="button" class="w-full text-[11px] font-semibold py-1.5 rounded-lg bg-primary-600 text-white hover:bg-primary-700" @click="applyHourSlice">
+              Применить часы к периоду
+            </button>
+          </div>
+          <p class="text-[10px] text-gray-400 leading-snug">Пресеты 6–10, 10–16… — по <strong>первому календарному дню</strong> из файла. «−2 ч» — от конца данных.</p>
+        </div>
+
         <div v-if="availableRoutes.length > 0" class="space-y-1">
           <label class="text-xs text-gray-500">Маршруты (не выбрано = все)</label>
           <div class="h-24 overflow-y-auto border border-gray-200 rounded-md p-2 bg-gray-50 custom-scrollbar grid grid-cols-2 gap-1">
@@ -242,6 +415,53 @@ const exportPdf = () => {
               v-model="params.include_zero"
               class="w-4 h-4 text-primary-600 rounded"
             />
+          </div>
+
+          <div class="space-y-2 p-2 bg-primary-50 rounded-lg border border-primary-100">
+            <div class="flex items-center justify-between gap-2">
+              <div class="flex flex-col min-w-0">
+                <span class="text-sm text-primary-800 font-medium">Привязка к дорогам</span>
+                <span class="text-[10px] text-primary-600 leading-tight">OSRM (сеть) или QGIS (ваш слой)</span>
+              </div>
+              <input
+                type="checkbox"
+                v-model="params.map_matching"
+                class="w-4 h-4 text-primary-600 rounded shrink-0"
+              />
+            </div>
+            <div v-if="params.map_matching" class="space-y-2 pt-1 border-t border-primary-100/80">
+              <label class="text-[10px] text-primary-700 font-medium">Движок</label>
+              <select
+                v-model="params.snap_engine"
+                class="w-full text-xs p-2 border border-primary-200 rounded-md bg-white focus:ring-1 focus:ring-primary-500 outline-none"
+              >
+                <option value="osrm">OSRM Match (публичный сервер)</option>
+                <option value="qgis">Граф дорог (GeoJSON, Shapely)</option>
+              </select>
+              <template v-if="params.snap_engine === 'qgis'">
+                <label class="text-[10px] text-primary-700 font-medium">Файл дорог (GeoJSON / SHP)</label>
+                <input
+                  v-model="params.roads_geojson_path"
+                  type="text"
+                  placeholder="D:\data\roads.geojson или ROADS_GEOJSON_PATH на сервере"
+                  class="w-full text-xs p-2 border border-primary-200 rounded-md bg-white font-mono"
+                />
+                <div class="flex items-center gap-2">
+                  <label class="text-[10px] text-primary-700 shrink-0">Допуск, м</label>
+                  <input
+                    v-model.number="params.snap_tolerance_m"
+                    type="number"
+                    min="5"
+                    max="500"
+                    step="5"
+                    class="flex-1 text-xs p-1.5 border border-primary-200 rounded-md bg-white"
+                  />
+                </div>
+                <p class="text-[9px] text-primary-600 leading-snug">
+                  Линейный граф (как <code class="text-primary-800">highway_graph.geojson</code>): на сервере идёт последовательный подбор (Viterbi) по треку ТС. Для максимально гладкой привязки попробуйте движок <strong>OSRM</strong> (если устраивает внешний сервис).
+                </p>
+              </template>
+            </div>
           </div>
 
           <div class="space-y-1">

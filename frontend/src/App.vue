@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, provide } from 'vue'
+import { ref, provide } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import MainMap from './components/MainMap.vue'
 import ChartSection from './components/ChartSection.vue'
@@ -8,10 +8,17 @@ import StatsPanel from './components/StatsPanel.vue'
 const isSidebarOpen = ref(true)
 const analysisResult = ref(null)
 const isLoading = ref(false)
+/** GeoJSON Polygon | MultiPolygon | null — область анализа на карте (WGS84) */
+const analysisAreaGeometry = ref(null)
 
 // Provide shared state/actions
 provide('analysisResult', analysisResult)
 provide('isLoading', isLoading)
+provide('analysisAreaGeometry', analysisAreaGeometry)
+
+const toggleSidebar = () => {
+  isSidebarOpen.value = !isSidebarOpen.value
+}
 
 const handleAnalysisComplete = (data) => {
   analysisResult.value = data

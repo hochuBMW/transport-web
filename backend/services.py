@@ -1,9 +1,101 @@
 # backend/services.py
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from math import sqrt
-from datetime import timedelta
+from datetime import datetime, timedelta
 from collections import defaultdict
+import logging
+import os
+import requests
 from utils import haversine_m, parse_time
+
+logger = logging.getLogger(__name__)
+
+OSRM_MATCH_URL = "http://router.project-osrm.org/match/v1/driving/{coords}"
+
+def snap_features(features: List[Dict[str, Any]], max_chunk_size=90) -> List[Dict[str, Any]]:
+    """Snaps a list of features to the road network using OSRM Match API"""
+    if not features:
+        return features
+
+    vehicles = defaultdict(list)
+    for i, feat in enumerate(features):
+        props = feat.get("properties", {})
+        veh_id = props.get("gos_num") or props.get("plate") or props.get("bnum") or "unknown"
+        vehicles[veh_id].append((i, feat))
+
+    snapped_features = features.copy()
+    
+    for veh_id, v_list in vehicles.items():
+        v_list.sort(key=lambda x: parse_time(x[1]["properties"].get("time", "")) or datetime.min)
+        
+        for i in range(0, len(v_list), max_chunk_size):
+            chunk = v_list[i:i + max_chunk_size]
+            if len(chunk) < 2:
+                continue
+                
+            coords_str = ";".join([f"{f[1]['geometry']['coordinates'][0]},{f[1]['geometry']['coordinates'][1]}" for f in chunk])
+            
+            radiuses = ";".join(["50" for _ in chunk])
+            
+            url = f"{OSRM_MATCH_URL.format(coords=coords_str)}?overview=false&radiuses={radiuses}&gaps=ignore"
+            
+            try:
+                response = requests.get(
+                    url, 
+                    headers={"User-Agent": "TransportWebMapMatcher/1.0 (Student Diplome)"},
+                    timeout=5
+                )
+                if response.status_code == 429:
+                    print("Внимание: достигнут лимит OSRM (Too Many Requests). Прекращаем привязку оставшихся точек.")
+                    return snapped_features
+                    
+                if response.status_code == 200:
+                    res_json = response.json()
+                    if res_json.get("code") == "Ok":
+                        tracepoints = res_json.get("tracepoints", [])
+                        for idx, trace in enumerate(tracepoints):
+                            orig_index = chunk[idx][0]
+                            if trace is not None and "location" in trace:
+                                new_coords = trace["location"]
+                                snapped_features[orig_index]["geometry"]["coordinates"] = new_coords
+                                snapped_features[orig_index]["properties"]["snapped"] = True
+            except Exception as e:
+                pass # Ignore matching errors and keep original coords
+
+    return snapped_features
+
+
+def snap_features_by_engine(
+    features: List[Dict[str, Any]],
+    engine: str,
+    roads_path: Optional[str] = None,
+    tolerance_m: float = 50.0,
+) -> List[Dict[str, Any]]:
+    """
+    engine: "osrm" — публичный OSRM Match; "qgis" — PyQGIS snap to layer (нужен QGIS Python).
+    """
+    if not features:
+        return features
+    eng = (engine or "osrm").strip().lower()
+    if eng == "qgis":
+        path = (roads_path or os.environ.get("ROADS_GEOJSON_PATH") or "").strip()
+        if not path:
+            logger.warning("snap_engine=qgis: задайте roads_geojson_path в запросе или ROADS_GEOJSON_PATH в .env")
+            return features
+        # Граф дорог: Shapely + STRtree (обычный Python). PyQGIS — только если USE_QGIS_SNAP=1
+        if os.environ.get("USE_QGIS_SNAP", "").lower() in ("1", "true", "yes"):
+            try:
+                from qgis_snap_service import snap_features_pyqgis, qgis_available
+
+                if qgis_available():
+                    return snap_features_pyqgis(features, path, tolerance_m=tolerance_m)
+            except Exception as e:
+                logger.warning("QGIS snap отключён, используем граф (Shapely): %s", e)
+        from road_graph_snap import snap_features_to_roads_geojson
+
+        return snap_features_to_roads_geojson(features, path, tolerance_m=tolerance_m)
+    return snap_features(features)
+
 
 def calculate_statistics(speeds: List[float]) -> Dict[str, float]:
     """Calculate comprehensive speed statistics."""
