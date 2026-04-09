@@ -91,6 +91,37 @@ const getSpeedColor = (s) => {
   return "#22c55e" // Green
 }
 
+/** dir — градусы курса от севера по часовой стрелке (как в навигации) */
+const parseDirDegrees = (dir) => {
+  const n = Number(dir)
+  return Number.isFinite(n) ? ((n % 360) + 360) % 360 : null
+}
+
+/** Каплевидный маркер: остриё указывает направление движения */
+const createBusDirectionIcon = (fillColor, dir) => {
+  const deg = parseDirDegrees(dir)
+  const rotation = deg != null ? deg : 0
+  // viewBox 32×40: остриё сверху (север), центр вращения ~ (16, 20)
+  const html = `<svg width="22" height="28" viewBox="0 0 32 40" style="display:block" aria-hidden="true">
+    <g transform="rotate(${rotation} 16 20)">
+      <path
+        fill="${fillColor}"
+        stroke="#ffffff"
+        stroke-width="1.1"
+        stroke-linejoin="round"
+        d="M16 3 C22 9 27 17 27 25 C27 33 22 37 16 37 C10 37 5 33 5 25 C5 17 10 9 16 3 Z"
+      />
+    </g>
+  </svg>`
+  return L.divIcon({
+    className: 'bus-dir-marker',
+    html,
+    iconSize: [22, 28],
+    iconAnchor: [11, 14],
+    popupAnchor: [0, -15],
+  })
+}
+
 watch(() => props.data, (newData) => {
   if (!newData) {
     if (routeLayer) map.removeLayer(routeLayer)
@@ -140,9 +171,17 @@ const drawMap = () => {
   } else {
     routeLayer = L.geoJSON(props.data.filtered_geojson, {
       pointToLayer: (feature, latlng) => {
+        const color = getSpeedColor(feature.properties.speed)
+        const dir = feature.properties?.dir
+        if (parseDirDegrees(dir) != null) {
+          return L.marker(latlng, {
+            icon: createBusDirectionIcon(color, dir),
+            interactive: true,
+          })
+        }
         return L.circleMarker(latlng, {
           radius: 4,
-          fillColor: getSpeedColor(feature.properties.speed),
+          fillColor: color,
           color: "#fff",
           weight: 1,
           opacity: 1,
@@ -181,6 +220,11 @@ const drawMap = () => {
                 <span class="text-gray-500">Скорость:</span>
                 <span class="font-bold ${p.speed < 10 ? 'text-red-500' : 'text-green-600'}">${p.speed.toFixed(1)} км/ч</span>
               </div>
+              ${parseDirDegrees(p.dir) != null ? `
+              <div class="flex justify-between text-sm">
+                <span class="text-gray-500">Курс:</span>
+                <span class="font-mono font-semibold text-gray-800">${parseDirDegrees(p.dir).toFixed(0)}°</span>
+              </div>` : ''}
             </div>
 
             <div class="grid grid-cols-2 gap-2 pt-1">
@@ -289,7 +333,13 @@ watch(
           <div class="w-3 h-3 rounded-full bg-[#22c55e]"></div>
           <span class="text-xs text-gray-600">> 40 км/ч</span>
         </div>
-        <div class="pt-2 mt-1 border-t border-gray-100">
+        <div class="pt-2 mt-1 border-t border-gray-100 space-y-1">
+          <div class="flex items-start gap-2 opacity-80">
+            <svg class="w-3 h-3 shrink-0 mt-0.5 text-gray-600" viewBox="0 0 32 40" aria-hidden="true">
+              <path fill="currentColor" d="M16 3 C22 9 27 17 27 25 C27 33 22 37 16 37 C10 37 5 33 5 25 C5 17 10 9 16 3 Z" />
+            </svg>
+            <span class="text-[10px] text-gray-500 leading-tight">ТС: капля по курсу (поле <code class="text-gray-600">dir</code>)</span>
+          </div>
           <div class="flex items-center gap-2 opacity-70">
             <div class="w-3 h-3 rounded bg-[#ef4444]/30 border border-[#ef4444]"></div>
             <span class="text-[10px] text-gray-500 font-medium">Зона затора</span>
@@ -301,6 +351,10 @@ watch(
 </template>
 
 <style>
+.bus-dir-marker {
+  background: transparent !important;
+  border: none !important;
+}
 .leaflet-popup-content-wrapper {
   border-radius: 12px;
   box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1);
