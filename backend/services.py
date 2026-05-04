@@ -5,96 +5,111 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import logging
 import os
-import requests
-from utils import haversine_m, parse_time
+from utils import (
+    haversine_m,
+    parse_time,
+    bearing_deg,
+    circular_mean_bearing_deg,
+    direction_bin_from_ref,
+)
 
 logger = logging.getLogger(__name__)
 
-OSRM_MATCH_URL = "http://router.project-osrm.org/match/v1/driving/{coords}"
-
-def snap_features(features: List[Dict[str, Any]], max_chunk_size=90) -> List[Dict[str, Any]]:
-    """Snaps a list of features to the road network using OSRM Match API"""
-    if not features:
-        return features
-
-    vehicles = defaultdict(list)
-    for i, feat in enumerate(features):
-        props = feat.get("properties", {})
-        veh_id = props.get("gos_num") or props.get("plate") or props.get("bnum") or "unknown"
-        vehicles[veh_id].append((i, feat))
-
-    snapped_features = features.copy()
-    
-    for veh_id, v_list in vehicles.items():
-        v_list.sort(key=lambda x: parse_time(x[1]["properties"].get("time", "")) or datetime.min)
-        
-        for i in range(0, len(v_list), max_chunk_size):
-            chunk = v_list[i:i + max_chunk_size]
-            if len(chunk) < 2:
-                continue
-                
-            coords_str = ";".join([f"{f[1]['geometry']['coordinates'][0]},{f[1]['geometry']['coordinates'][1]}" for f in chunk])
-            
-            radiuses = ";".join(["50" for _ in chunk])
-            
-            url = f"{OSRM_MATCH_URL.format(coords=coords_str)}?overview=false&radiuses={radiuses}&gaps=ignore"
-            
-            try:
-                response = requests.get(
-                    url, 
-                    headers={"User-Agent": "TransportWebMapMatcher/1.0 (Student Diplome)"},
-                    timeout=5
-                )
-                if response.status_code == 429:
-                    print("Внимание: достигнут лимит OSRM (Too Many Requests). Прекращаем привязку оставшихся точек.")
-                    return snapped_features
-                    
-                if response.status_code == 200:
-                    res_json = response.json()
-                    if res_json.get("code") == "Ok":
-                        tracepoints = res_json.get("tracepoints", [])
-                        for idx, trace in enumerate(tracepoints):
-                            orig_index = chunk[idx][0]
-                            if trace is not None and "location" in trace:
-                                new_coords = trace["location"]
-                                snapped_features[orig_index]["geometry"]["coordinates"] = new_coords
-                                snapped_features[orig_index]["properties"]["snapped"] = True
-            except Exception as e:
-                pass # Ignore matching errors and keep original coords
-
-    return snapped_features
+def default_roads_graph_path() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(here, ".."))
+    return os.path.join(project_root, "highway_graph.geojson")
 
 
-def snap_features_by_engine(
+def snap_features_to_road_graph(
     features: List[Dict[str, Any]],
-    engine: str,
-    roads_path: Optional[str] = None,
     tolerance_m: float = 50.0,
 ) -> List[Dict[str, Any]]:
-    """
-    engine: "osrm" — публичный OSRM Match; "qgis" — PyQGIS snap to layer (нужен QGIS Python).
-    """
     if not features:
         return features
-    eng = (engine or "osrm").strip().lower()
-    if eng == "qgis":
-        path = (roads_path or os.environ.get("ROADS_GEOJSON_PATH") or "").strip()
-        if not path:
-            logger.warning("snap_engine=qgis: задайте roads_geojson_path в запросе или ROADS_GEOJSON_PATH в .env")
-            return features
-        # Граф дорог: Shapely + STRtree (обычный Python). PyQGIS — только если USE_QGIS_SNAP=1
-        if os.environ.get("USE_QGIS_SNAP", "").lower() in ("1", "true", "yes"):
-            try:
-                from qgis_snap_service import snap_features_pyqgis, qgis_available
 
-                if qgis_available():
-                    return snap_features_pyqgis(features, path, tolerance_m=tolerance_m)
-            except Exception as e:
-                logger.warning("QGIS snap отключён, используем граф (Shapely): %s", e)
-        from road_graph_snap import snap_features_to_roads_geojson
+    roads_path = default_roads_graph_path()
+    if not os.path.isfile(roads_path):
+        logger.warning("Файл дорожного графа не найден: %s", roads_path)
+        return features
 
-        return snap_features_to_roads_geojson(features, path, tolerance_m=tolerance_m)
-    return snap_features(features)
+    from road_graph_snap import snap_features_to_roads_geojson
+    return snap_features_to_roads_geojson(features, roads_path, tolerance_m=tolerance_m)
+
+
+def track_key_from_props(props: Dict[str, Any]) -> str:
+    """Ключ трека для группировки точек одного ТС / маршрута."""
+    vid = (
+        props.get("vehicle_id")
+        or props.get("vehicle")
+        or props.get("board")
+        or props.get("gsm")
+        or props.get("gos_num")
+        or props.get("plate")
+        or props.get("bnum")
+        or ""
+    )
+    r = props.get("route_num") or ""
+    return f"{vid}|{r}"
+
+
+def compute_flow_directions(
+    features: List[Dict[str, Any]],
+    min_segment_m: float = 8.0,
+) -> Tuple[List[Optional[int]], List[Optional[float]], float]:
+    """
+    По цепочкам точек (по треку) считает азимут движения и делит на два направления
+    относительно среднего азимута сегментов в выборке.
+
+    Возвращает:
+      dirs[i] — 0 или 1 относительно опорного направления, либо None если не удалось определить;
+      point_bearings[i] — азимут в точке (для отображения стрелки);
+      ref_bearing — опорный азимут (круговое среднее сегментов).
+    """
+    n = len(features)
+    point_bearings: List[Optional[float]] = [None] * n
+    segment_bearings: List[float] = []
+
+    groups: Dict[str, List[int]] = defaultdict(list)
+    for i, feat in enumerate(features):
+        props = feat.get("properties") or {}
+        groups[track_key_from_props(props)].append(i)
+
+    for _key, indices in groups.items():
+        indices_sorted = sorted(
+            indices,
+            key=lambda i: parse_time(features[i]["properties"].get("time")) or datetime.min,
+        )
+        for a in range(len(indices_sorted) - 1):
+            i, j = indices_sorted[a], indices_sorted[a + 1]
+            coords_i = features[i].get("geometry", {}).get("coordinates") or []
+            coords_j = features[j].get("geometry", {}).get("coordinates") or []
+            if len(coords_i) < 2 or len(coords_j) < 2:
+                continue
+            lon1, lat1 = float(coords_i[0]), float(coords_i[1])
+            lon2, lat2 = float(coords_j[0]), float(coords_j[1])
+            d = haversine_m(lon1, lat1, lon2, lat2)
+            if d < min_segment_m:
+                continue
+            b = bearing_deg(lon1, lat1, lon2, lat2)
+            segment_bearings.append(b)
+            point_bearings[j] = b
+            if point_bearings[i] is None:
+                point_bearings[i] = b
+
+    if not segment_bearings:
+        return [None] * n, point_bearings, 0.0
+
+    ref = circular_mean_bearing_deg(segment_bearings)
+    dirs: List[Optional[int]] = []
+    for i in range(n):
+        pb = point_bearings[i]
+        if pb is None:
+            dirs.append(None)
+        else:
+            dirs.append(direction_bin_from_ref(pb, ref))
+
+    return dirs, point_bearings, ref
 
 
 def calculate_statistics(speeds: List[float]) -> Dict[str, float]:

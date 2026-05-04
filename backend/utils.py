@@ -1,6 +1,6 @@
 # backend/utils.py
 import logging
-from math import radians, cos, sin, asin, sqrt
+from math import radians, cos, sin, asin, sqrt, atan2, degrees
 from datetime import datetime
 from dateutil import parser
 from typing import Any, Dict, Optional
@@ -8,6 +8,35 @@ from typing import Any, Dict, Optional
 from shapely.geometry import Point, shape
 
 logger = logging.getLogger(__name__)
+
+def bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """
+    Начальный азимут от точки 1 к точке 2, градусы [0, 360), по часовой от севера.
+    """
+    φ1, φ2 = radians(lat1), radians(lat2)
+    dλ = radians(lon2 - lon1)
+    x = sin(dλ) * cos(φ2)
+    y = cos(φ1) * sin(φ2) - sin(φ1) * cos(φ2) * cos(dλ)
+    θ = atan2(x, y)
+    return (degrees(θ) + 360) % 360
+
+
+def circular_mean_bearing_deg(bearings: list) -> float:
+    """Круговое среднее набора азимутов, градусы [0, 360)."""
+    if not bearings:
+        return 0.0
+    xr = sum(cos(radians(b)) for b in bearings)
+    yr = sum(sin(radians(b)) for b in bearings)
+    return degrees(atan2(yr, xr)) % 360
+
+
+def direction_bin_from_ref(bearing: float, ref: float) -> int:
+    """
+    Деление пополам относительно ref: 0 — тот же полукруг, что и ref; 1 — противоположный.
+    """
+    d = radians(bearing - ref)
+    return 0 if cos(d) >= 0 else 1
+
 
 def haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     """

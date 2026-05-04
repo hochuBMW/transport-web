@@ -1,5 +1,5 @@
 <script setup>
-import { ref, inject, computed } from 'vue'
+import { ref, inject, computed, watch } from 'vue'
 import axios from 'axios'
 import { ChevronLeft, ChevronRight, Upload, Play, Trash2, Download, Activity, Clock } from 'lucide-vue-next'
 
@@ -19,10 +19,16 @@ const params = ref({
   min_pts: 4,
   routes: [],
   map_matching: false,
-  snap_engine: 'osrm',
-  roads_geojson_path: '',
   snap_tolerance_m: 50,
+  bidirectional_analysis: false,
 })
+
+watch(
+  () => analysisAreaGeometry?.value,
+  (g) => {
+    if (!g) params.value.bidirectional_analysis = false
+  }
+)
 
 const rawGeoJson = ref(null)
 const fileName = ref('')
@@ -204,10 +210,9 @@ const buildPayload = () => ({
   min_pts: params.value.min_pts,
   routes: params.value.routes.length > 0 ? params.value.routes : null,
   map_matching: params.value.map_matching,
-  snap_engine: params.value.map_matching ? params.value.snap_engine : 'osrm',
-  roads_geojson_path: params.value.roads_geojson_path?.trim() || null,
   snap_tolerance_m: params.value.snap_tolerance_m,
   analysis_geometry: analysisAreaGeometry?.value || null,
+  bidirectional_analysis: params.value.bidirectional_analysis,
 })
 
 const runAnalysis = async () => {
@@ -270,7 +275,7 @@ const exportPdf = () => {
     <div class="p-4 border-b border-gray-100 flex items-center justify-between overflow-hidden whitespace-nowrap">
       <h1 v-if="isOpen" class="font-bold text-lg text-primary-600 flex items-center gap-2">
         <Activity class="w-6 h-6" />
-        Анализ транспорта
+        Анализ транспорта (проверка)
       </h1>
       <button 
         @click="emit('toggle')"
@@ -319,7 +324,7 @@ const exportPdf = () => {
           На карте слева: инструмент <strong>полигон</strong>. После выделения анализ учитывает только точки внутри области.
         </p>
         <div
-          v-if="analysisAreaGeometry?.value"
+          v-if="analysisAreaGeometry"
           class="flex items-center justify-between gap-2 p-2 rounded-lg bg-primary-50 border border-primary-100"
         >
           <span class="text-xs text-primary-800 font-medium">Область задана</span>
@@ -332,6 +337,24 @@ const exportPdf = () => {
           </button>
         </div>
         <p v-else class="text-[11px] text-gray-400 italic">Без выделения — по всему файлу</p>
+        <div
+          class="flex items-start justify-between gap-2 p-2 rounded-lg border border-gray-100 bg-gray-50/80"
+          :class="!analysisAreaGeometry ? 'opacity-60' : ''"
+        >
+          <div class="min-w-0">
+            <span class="text-xs font-medium text-gray-800">Две стороны движения</span>
+            <p class="text-[10px] text-gray-500 leading-snug mt-0.5">
+              Отдельная ср. скорость, индекс затора и зоны по каждому направлению в полигоне (по цепочкам GPS).
+            </p>
+          </div>
+          <input
+            type="checkbox"
+            v-model="params.bidirectional_analysis"
+            :disabled="!analysisAreaGeometry"
+            class="w-4 h-4 text-primary-600 rounded shrink-0 mt-0.5"
+            title="Сначала нарисуйте полигон на карте"
+          />
+        </div>
       </div>
 
       <!-- Section: Analysis Parameters -->
@@ -421,7 +444,7 @@ const exportPdf = () => {
             <div class="flex items-center justify-between gap-2">
               <div class="flex flex-col min-w-0">
                 <span class="text-sm text-primary-800 font-medium">Привязка к дорогам</span>
-                <span class="text-[10px] text-primary-600 leading-tight">OSRM (сеть) или QGIS (ваш слой)</span>
+                <span class="text-[10px] text-primary-600 leading-tight">Привязка к графу дорожной сети проекта</span>
               </div>
               <input
                 type="checkbox"
@@ -430,37 +453,20 @@ const exportPdf = () => {
               />
             </div>
             <div v-if="params.map_matching" class="space-y-2 pt-1 border-t border-primary-100/80">
-              <label class="text-[10px] text-primary-700 font-medium">Движок</label>
-              <select
-                v-model="params.snap_engine"
-                class="w-full text-xs p-2 border border-primary-200 rounded-md bg-white focus:ring-1 focus:ring-primary-500 outline-none"
-              >
-                <option value="osrm">OSRM Match (публичный сервер)</option>
-                <option value="qgis">Граф дорог (GeoJSON, Shapely)</option>
-              </select>
-              <template v-if="params.snap_engine === 'qgis'">
-                <label class="text-[10px] text-primary-700 font-medium">Файл дорог (GeoJSON / SHP)</label>
+              <div class="flex items-center gap-2">
+                <label class="text-[10px] text-primary-700 shrink-0">Допуск, м</label>
                 <input
-                  v-model="params.roads_geojson_path"
-                  type="text"
-                  placeholder="D:\data\roads.geojson или ROADS_GEOJSON_PATH на сервере"
-                  class="w-full text-xs p-2 border border-primary-200 rounded-md bg-white font-mono"
+                  v-model.number="params.snap_tolerance_m"
+                  type="number"
+                  min="5"
+                  max="500"
+                  step="5"
+                  class="flex-1 text-xs p-1.5 border border-primary-200 rounded-md bg-white"
                 />
-                <div class="flex items-center gap-2">
-                  <label class="text-[10px] text-primary-700 shrink-0">Допуск, м</label>
-                  <input
-                    v-model.number="params.snap_tolerance_m"
-                    type="number"
-                    min="5"
-                    max="500"
-                    step="5"
-                    class="flex-1 text-xs p-1.5 border border-primary-200 rounded-md bg-white"
-                  />
-                </div>
-                <p class="text-[9px] text-primary-600 leading-snug">
-                  Линейный граф (как <code class="text-primary-800">highway_graph.geojson</code>): на сервере идёт последовательный подбор (Viterbi) по треку ТС. Для максимально гладкой привязки попробуйте движок <strong>OSRM</strong> (если устраивает внешний сервис).
-                </p>
-              </template>
+              </div>
+              <p class="text-[9px] text-primary-600 leading-snug">
+                Граф дорог загружается автоматически из файла <code class="text-primary-800">highway_graph.geojson</code> в корне проекта.
+              </p>
             </div>
           </div>
 

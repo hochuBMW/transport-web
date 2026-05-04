@@ -172,7 +172,7 @@ const drawMap = () => {
     routeLayer = L.geoJSON(props.data.filtered_geojson, {
       pointToLayer: (feature, latlng) => {
         const color = getSpeedColor(feature.properties.speed)
-        const dir = feature.properties?.dir
+        const dir = feature.properties?.dir ?? feature.properties?.flow_bearing
         if (parseDirDegrees(dir) != null) {
           return L.marker(latlng, {
             icon: createBusDirectionIcon(color, dir),

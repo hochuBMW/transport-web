@@ -13,9 +13,26 @@ const chartHost = ref(null)
 let chart = null
 let resizeObserver = null
 const dashboardTab = ref('overview')
+/** all — сводка по полигону; 0/1 — отдельное направление (bidirectional) */
+const flowDirTab = ref('all')
+
+watch(
+  () => props.data,
+  () => {
+    flowDirTab.value = 'all'
+  }
+)
+
+const activeStatsSource = computed(() => {
+  const d = props.data
+  if (!d) return null
+  if (flowDirTab.value === 'all' || !d.bidirectional) return d
+  const dir = d.bidirectional.directions?.find((x) => x.id === flowDirTab.value)
+  return dir || d
+})
 
 const statsItems = computed(() => {
-  const d = props.data
+  const d = activeStatsSource.value
   if (!d) return []
   const s = d.statistics || {}
   const ci = d.congestion_index || 1
@@ -28,17 +45,32 @@ const statsItems = computed(() => {
     ciColor = 'text-red-600'
     ciBg = 'bg-red-50'
   }
+  const countVal =
+    flowDirTab.value !== 'all' && props.data?.bidirectional ? d.count ?? 0 : d.count || 0
+  const empty = (d.count ?? 0) === 0
   return [
-    { label: 'Ср. скорость', value: (d.avg_speed || 0).toFixed(1) + ' км/ч', icon: TrendingUp, color: 'text-blue-600', bg: 'bg-blue-50' },
-    { label: 'Индекс затора', value: `${ci} / 10`, icon: Activity, color: ciColor, bg: ciBg },
+    {
+      label: 'Ср. скорость',
+      value: empty ? '—' : (d.avg_speed != null ? d.avg_speed : 0).toFixed(1) + ' км/ч',
+      icon: TrendingUp,
+      color: 'text-blue-600',
+      bg: 'bg-blue-50',
+    },
+    { label: 'Индекс затора', value: empty ? '—' : `${ci} / 10`, icon: Activity, color: ciColor, bg: ciBg },
     { label: 'Зон заторов', value: d.congestion_zones?.length || 0, icon: ShieldAlert, color: 'text-red-600', bg: 'bg-red-50' },
-    { label: 'Всего точек', value: d.count || 0, icon: MapPin, color: 'text-gray-600', bg: 'bg-gray-100' },
-    { label: 'Медиана', value: (s.median || 0).toFixed(1) + ' км/ч', icon: Zap, color: 'text-purple-600', bg: 'bg-purple-50' },
+    { label: 'Всего точек', value: countVal, icon: MapPin, color: 'text-gray-600', bg: 'bg-gray-100' },
+    {
+      label: 'Медиана',
+      value: empty ? '—' : (s.median || 0).toFixed(1) + ' км/ч',
+      icon: Zap,
+      color: 'text-purple-600',
+      bg: 'bg-purple-50',
+    },
   ]
 })
 
 const intervals1h = computed(() =>
-  rankIntervalsByAvgSpeed(props.data?.plot?.raw_times, props.data?.plot?.raw_speeds, 1, 8)
+  rankIntervalsByAvgSpeed(activeStatsSource.value?.plot?.raw_times, activeStatsSource.value?.plot?.raw_speeds, 1, 8)
 )
 
 const formatIvLabel = (r) => {
@@ -49,7 +81,7 @@ const formatIvLabel = (r) => {
 }
 
 const pickPlotSeries = () => {
-  const plot = props.data?.plot
+  const plot = activeStatsSource.value?.plot
   if (!plot) return { times: [], speeds: [] }
   let times = Array.from(plot.times || [])
   let speeds = Array.from(plot.speeds || [])
@@ -163,13 +195,14 @@ const scheduleInitChart = () => {
 }
 
 const plotWatchKey = () => {
-  const p = props.data?.plot
+  const p = activeStatsSource.value?.plot
   if (!p) return ''
   const t = p.times
   const s = p.speeds
   const rt = p.raw_times
   const rs = p.raw_speeds
   return [
+    flowDirTab.value,
     t?.length ?? 0,
     s?.length ?? 0,
     t?.[0],
@@ -190,6 +223,12 @@ onMounted(() => {
 })
 
 watch(plotWatchKey, scheduleInitChart)
+
+watch(flowDirTab, () => {
+  nextTick(() => {
+    requestAnimationFrame(() => chart?.resize())
+  })
+})
 
 watch(dashboardTab, (tab) => {
   if (tab !== 'overview') return
@@ -239,6 +278,45 @@ onUnmounted(() => {
         <Timer class="w-3.5 h-3.5" />
         Тяжёлые интервалы
       </button>
+    </div>
+
+    <div
+      v-if="data?.bidirectional"
+      class="flex flex-col gap-1.5 border-b border-gray-100 pb-2 flex-shrink-0"
+    >
+      <div class="flex flex-wrap items-center gap-1">
+        <span class="text-[10px] text-gray-500 font-semibold uppercase shrink-0">Направление</span>
+        <button
+          type="button"
+          :class="[
+            'px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors',
+            flowDirTab === 'all'
+              ? 'bg-slate-700 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
+          ]"
+          @click="flowDirTab = 'all'"
+        >
+          Все точки
+        </button>
+        <button
+          v-for="dir in data.bidirectional.directions"
+          :key="dir.id"
+          type="button"
+          :class="[
+            'px-2.5 py-1 rounded-lg text-[11px] font-semibold transition-colors',
+            flowDirTab === dir.id
+              ? 'bg-primary-600 text-white'
+              : 'bg-gray-100 text-gray-600 hover:bg-gray-200',
+          ]"
+          @click="flowDirTab = dir.id"
+        >
+          {{ dir.label }}
+        </button>
+      </div>
+      <p v-if="flowDirTab === 'all'" class="text-[10px] text-gray-500 leading-snug">
+        Опорный азимут сегментов: {{ Number(data.bidirectional.reference_bearing_deg).toFixed(1) }}°.
+        Без направления (короткие шаги): {{ data.bidirectional.unclassified_count }}.
+      </p>
     </div>
 
     <div v-show="dashboardTab === 'overview'" class="flex-1 min-h-0 flex flex-col md:flex-row gap-6 overflow-hidden">
