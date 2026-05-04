@@ -275,7 +275,7 @@ const exportPdf = () => {
     <div class="p-4 border-b border-gray-100 flex items-center justify-between overflow-hidden whitespace-nowrap">
       <h1 v-if="isOpen" class="font-bold text-lg text-primary-600 flex items-center gap-2">
         <Activity class="w-6 h-6" />
-        Анализ транспорта (проверка)
+        тест для проверки
       </h1>
       <button 
         @click="emit('toggle')"
