@@ -2,13 +2,14 @@
 import { ref, inject, computed, watch } from 'vue'
 import axios from 'axios'
 import { ChevronLeft, ChevronRight, Upload, Play, Trash2, Download, Activity, Clock } from 'lucide-vue-next'
+import { API_BASE } from '../apiBase.js'
 
 const props = defineProps(['isOpen'])
 const emit = defineEmits(['toggle', 'analysis-complete'])
 
-const API_URL = "http://127.0.0.1:8000/analyze"
-const API_DB_URL = "http://127.0.0.1:8000/analyze/db"
-const API_DB_META_URL = "http://127.0.0.1:8000/analyze/db/meta"
+const API_URL = `${API_BASE}/analyze`
+const API_DB_URL = `${API_BASE}/analyze/db`
+const API_DB_META_URL = `${API_BASE}/analyze/db/meta`
 const isLoading = inject('isLoading')
 const analysisAreaGeometry = inject('analysisAreaGeometry')
 const dataSource = ref('file') // file | db
@@ -25,6 +26,7 @@ const params = ref({
   snap_tolerance_m: 50,
   bidirectional_analysis: false,
   max_points: 100000,
+  render_points_limit: 3000,
 })
 
 watch(
@@ -276,6 +278,7 @@ const buildPayload = () => ({
   analysis_geometry: analysisAreaGeometry?.value || null,
   bidirectional_analysis: params.value.bidirectional_analysis,
   max_points: params.value.max_points,
+  render_points_limit: params.value.render_points_limit,
 })
 
 const runAnalysis = async () => {
@@ -593,6 +596,24 @@ const exportPdf = () => {
               <span class="text-xs font-medium">{{ params.max_points }}</span>
             </div>
             <input type="range" min="10000" max="300000" step="10000" v-model="params.max_points" class="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600" />
+          </div>
+
+          <div class="space-y-1">
+            <div class="flex justify-between">
+              <label class="text-xs text-gray-500">Точек на карту</label>
+              <span class="text-xs font-medium">{{ params.render_points_limit }}</span>
+            </div>
+            <input
+              type="range"
+              min="1000"
+              max="30000"
+              step="1000"
+              v-model="params.render_points_limit"
+              class="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600"
+            />
+            <p class="text-[10px] text-gray-400 leading-snug">
+              Влияет только на плавность карты. Статистика считается по всем отфильтрованным точкам.
+            </p>
           </div>
         </div>
       </div>

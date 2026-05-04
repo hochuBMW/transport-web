@@ -2,8 +2,7 @@
 import { onMounted, onUnmounted, ref } from 'vue'
 import axios from 'axios'
 import { Play, Square, RefreshCw, Database } from 'lucide-vue-next'
-
-const API_BASE = 'http://127.0.0.1:8000'
+import { API_BASE } from '../apiBase.js'
 
 const status = ref({
   running: false,

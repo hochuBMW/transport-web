@@ -1,12 +1,12 @@
 <script setup>
-import { ref, provide } from 'vue'
+import { ref, shallowRef, provide } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import MainMap from './components/MainMap.vue'
 import ChartSection from './components/ChartSection.vue'
 import ParserTab from './components/ParserTab.vue'
 
 const isSidebarOpen = ref(true)
-const analysisResult = ref(null)
+const analysisResult = shallowRef(null)
 const isLoading = ref(false)
 const activeTab = ref('analysis')
 /** GeoJSON Polygon | MultiPolygon | null — область анализа на карте (WGS84) */

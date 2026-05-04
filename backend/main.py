@@ -3,6 +3,7 @@ import os
 import sys
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from datetime import timedelta, timezone
 from typing import Any, Dict, List, Optional
 import uvicorn
@@ -11,7 +12,7 @@ from shapely.geometry import MultiPoint, mapping
 from zoneinfo import ZoneInfo
 
 from models import AnalyzeRequest, AnalyzeDbRequest, ParserStartRequest
-from utils import parse_time, point_in_analysis_geometry
+from utils import parse_time, build_analysis_geometry_checker
 from services import (
     calculate_statistics,
     region_growing_clusters,
@@ -140,10 +141,19 @@ def _direction_payload(
     }
 
 
+def _downsample_indices(total: int, limit: int) -> List[int]:
+    if total <= limit:
+        return list(range(total))
+    if limit <= 1:
+        return [0]
+    step = (total - 1) / (limit - 1)
+    return [min(total - 1, round(i * step)) for i in range(limit)]
+
+
 app = FastAPI(
     title="Transport Analysis API",
     description="API для анализа транспортных данных и выявления зон заторов",
-    version="2.1.0"
+    version="2.1.0",
 )
 
 # Enable CORS
@@ -153,6 +163,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1024,
+    compresslevel=5,
 )
 
 @app.get("/")
@@ -314,6 +329,9 @@ async def analyze(req: AnalyzeRequest):
         slow_candidates = []
         slow_indices = []
 
+        analysis_contains = build_analysis_geometry_checker(req.analysis_geometry)
+        route_filter = set(req.routes) if req.routes else None
+
         # Process features
         for feat in features:
             geom = feat.get("geometry")
@@ -331,7 +349,7 @@ async def analyze(req: AnalyzeRequest):
             except (TypeError, ValueError):
                 continue
 
-            if req.analysis_geometry and not point_in_analysis_geometry(lon, lat, req.analysis_geometry):
+            if not analysis_contains(lon, lat):
                 continue
 
             # Parse time and apply +8 hours offset
@@ -348,7 +366,7 @@ async def analyze(req: AnalyzeRequest):
                 continue
             
             # Apply route filter
-            if req.routes and str(props.get("route_num")) not in req.routes:
+            if route_filter and str(props.get("route_num")) not in route_filter:
                 continue
 
             try:
@@ -416,7 +434,7 @@ async def analyze(req: AnalyzeRequest):
             "congestion_index": congestion_index,
             "dropped": dropped,
             "count": len(filtered_points),
-            "filtered_geojson": {"type": "FeatureCollection", "features": filtered_points},
+            "filtered_geojson": {"type": "FeatureCollection", "features": []},
             "congestion_zones": [],
             "plot": {"times": [], "speeds": []},
             "statistics": calculate_statistics(speeds) if speeds else {},
@@ -446,6 +464,15 @@ async def analyze(req: AnalyzeRequest):
             "raw_times": raw_times,
             "raw_speeds": speeds
         }
+
+        render_indices = _downsample_indices(len(filtered_points), req.render_points_limit)
+        result["filtered_geojson"]["features"] = [filtered_points[i] for i in render_indices]
+        if len(filtered_points) > req.render_points_limit:
+            result["warnings"].append(
+                "Карта отображает выборку точек для ускорения интерфейса "
+                f"({req.render_points_limit} из {len(filtered_points)}). "
+                "Статистика и зоны заторов рассчитаны по всем точкам."
+            )
 
         # Clustering
         if slow_candidates:
@@ -511,6 +538,7 @@ async def analyze_db(req: AnalyzeDbRequest):
             snap_tolerance_m=req.snap_tolerance_m,
             analysis_geometry=req.analysis_geometry,
             bidirectional_analysis=req.bidirectional_analysis,
+            render_points_limit=req.render_points_limit,
         )
         result = await analyze(bridge_req)
         if len(geojson.get("features", [])) >= req.max_points:

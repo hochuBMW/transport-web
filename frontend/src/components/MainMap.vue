@@ -16,13 +16,17 @@ let routeLayer = null
 let congestionLayer = null
 let heatLayer = null
 let drawnItems = null
+let canvasRenderer = null
+const HEAVY_FEATURES_THRESHOLD = 1500
 
 onMounted(() => {
-  map = L.map(mapContainer.value).setView([52.3, 104.3], 11)
+  map = L.map(mapContainer.value, { preferCanvas: true }).setView([52.3, 104.3], 11)
+  canvasRenderer = L.canvas({ padding: 0.5 })
   
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map)
+  map.attributionControl.setPrefix('')
 
   drawnItems = new L.FeatureGroup()
   map.addLayer(drawnItems)
@@ -131,7 +135,7 @@ watch(() => props.data, (newData) => {
   }
 
   drawMap()
-}, { deep: true })
+})
 
 watch(heatmapMode, () => {
   drawMap()
@@ -139,6 +143,8 @@ watch(heatmapMode, () => {
 
 const drawMap = () => {
   if (!props.data?.filtered_geojson) return
+  const features = props.data.filtered_geojson.features || []
+  const isHeavy = features.length > HEAVY_FEATURES_THRESHOLD
 
   // Clear existing
   if (routeLayer) map.removeLayer(routeLayer)
@@ -147,7 +153,7 @@ const drawMap = () => {
 
   // 1. Add Points/Route or Heatmap
   if (heatmapMode.value) {
-    const heatPoints = props.data.filtered_geojson.features.map(f => {
+    const heatPoints = features.map(f => {
       const p = f.properties
       const c = f.geometry.coordinates
       const speed = p.speed || 0
@@ -169,9 +175,21 @@ const drawMap = () => {
       map.fitBounds(bounds, { padding: [50, 50] })
     }
   } else {
-    routeLayer = L.geoJSON(props.data.filtered_geojson, {
+    routeLayer = L.geoJSON({ ...props.data.filtered_geojson, features }, {
       pointToLayer: (feature, latlng) => {
         const color = getSpeedColor(feature.properties.speed)
+        if (isHeavy) {
+          return L.circleMarker(latlng, {
+            radius: 2.5,
+            fillColor: color,
+            color: "#fff",
+            weight: 0.5,
+            opacity: 1,
+            fillOpacity: 0.75,
+            renderer: canvasRenderer,
+            interactive: false,
+          })
+        }
         const dir = feature.properties?.dir ?? feature.properties?.flow_bearing
         if (parseDirDegrees(dir) != null) {
           return L.marker(latlng, {
@@ -185,10 +203,12 @@ const drawMap = () => {
           color: "#fff",
           weight: 1,
           opacity: 1,
-          fillOpacity: 0.8
+          fillOpacity: 0.8,
+          renderer: canvasRenderer,
         })
       },
       onEachFeature: (feature, layer) => {
+        if (isHeavy) return
         const p = feature.properties
         
         // Map vehicle type

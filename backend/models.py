@@ -27,6 +27,12 @@ class AnalyzeRequest(BaseModel):
         False,
         description="Раздельная статистика по двум направлениям движения внутри полигона (нужен analysis_geometry).",
     )
+    render_points_limit: int = Field(
+        5000,
+        ge=1000,
+        le=200000,
+        description="Maximum number of points returned in filtered_geojson for map rendering (stats still use all points).",
+    )
 
     @validator("geojson")
     def validate_geojson(cls, v):
@@ -80,6 +86,12 @@ class AnalyzeDbRequest(BaseModel):
         ge=1000,
         le=500000,
         description="Max points to fetch from DB for one analysis request",
+    )
+    render_points_limit: int = Field(
+        5000,
+        ge=1000,
+        le=200000,
+        description="Maximum number of points returned in filtered_geojson for map rendering (stats still use all points).",
     )
 
     @validator("analysis_geometry")
