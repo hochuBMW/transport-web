@@ -1,15 +1,18 @@
 # backend/main.py
 import os
+import sys
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import timedelta
+from fastapi.middleware.gzip import GZipMiddleware
+from datetime import timedelta, timezone
 from typing import Any, Dict, List, Optional
 import uvicorn
 import logging
 from shapely.geometry import MultiPoint, mapping
+from zoneinfo import ZoneInfo
 
-from models import AnalyzeRequest
-from utils import parse_time, point_in_analysis_geometry
+from models import AnalyzeRequest, AnalyzeDbRequest, ParserStartRequest
+from utils import parse_time, build_analysis_geometry_checker
 from services import (
     calculate_statistics,
     region_growing_clusters,
@@ -18,10 +21,22 @@ from services import (
     default_roads_graph_path,
     compute_flow_directions,
 )
+from parser_control import parser_manager
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
+try:
+    import psycopg
+except Exception:  # pragma: no cover
+    psycopg = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+if load_dotenv is not None:
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=False)
 
 
 def _congestion_index_from_avg(avg_speed: float) -> int:
@@ -125,10 +140,20 @@ def _direction_payload(
         "congestion_zones": zones,
     }
 
+
+def _downsample_indices(total: int, limit: int) -> List[int]:
+    if total <= limit:
+        return list(range(total))
+    if limit <= 1:
+        return [0]
+    step = (total - 1) / (limit - 1)
+    return [min(total - 1, round(i * step)) for i in range(limit)]
+
+
 app = FastAPI(
     title="Transport Analysis API",
     description="API для анализа транспортных данных и выявления зон заторов",
-    version="2.1.0"
+    version="2.1.0",
 )
 
 # Enable CORS
@@ -138,6 +163,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+app.add_middleware(
+    GZipMiddleware,
+    minimum_size=1024,
+    compresslevel=5,
 )
 
 @app.get("/")
@@ -151,6 +181,125 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@app.get("/parser/status")
+async def parser_status():
+    return parser_manager.status()
+
+
+@app.post("/parser/start")
+async def parser_start(req: ParserStartRequest):
+    status = parser_manager.start(use_db=req.use_db, cookie=req.cookie)
+    return status
+
+
+@app.post("/parser/stop")
+async def parser_stop():
+    status = parser_manager.stop()
+    return status
+
+
+@app.get("/parser/logs")
+async def parser_logs(lines: int = 200):
+    try:
+        return parser_manager.read_logs(lines=lines)
+    except Exception as exc:
+        logger.error("Error reading parser logs: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+def _build_geojson_from_db(req: AnalyzeDbRequest) -> Dict[str, Any]:
+    if psycopg is None:
+        raise RuntimeError(
+            "psycopg is not installed in backend interpreter: "
+            f"{sys.executable}. Install with: \"{sys.executable}\" -m pip install psycopg[binary]"
+        )
+
+    dsn = os.getenv("IRKBUS_DB_DSN")
+    if not dsn:
+        raise RuntimeError("IRKBUS_DB_DSN is not configured.")
+
+    start_dt = parse_time(req.start) if req.start else None
+    end_dt = parse_time(req.end) if req.end else None
+    if start_dt and end_dt and start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="Start time must be before end time")
+
+    # Client time for DB mode is local Irkutsk time; convert to UTC for DB query.
+    irkutsk_tz = ZoneInfo("Asia/Irkutsk")
+    db_start = _to_utc_for_db(start_dt, irkutsk_tz) if start_dt else None
+    db_end = _to_utc_for_db(end_dt, irkutsk_tz) if end_dt else None
+
+    where = ["event_time IS NOT NULL", "geom IS NOT NULL"]
+    params: List[Any] = []
+    if db_start:
+        where.append("event_time >= %s")
+        params.append(db_start)
+    if db_end:
+        where.append("event_time <= %s")
+        params.append(db_end)
+    if req.routes:
+        where.append("route_num = ANY(%s)")
+        params.append(req.routes)
+
+    sql = f"""
+        SELECT
+            ST_X(geom) AS lon,
+            ST_Y(geom) AS lat,
+            vehicle_id,
+            rid,
+            route_num,
+            route_type,
+            speed_kmh,
+            dir_deg,
+            low_floor,
+            wifi,
+            gos_num,
+            event_time
+        FROM transport.telemetry_snapshot
+        WHERE {' AND '.join(where)}
+        ORDER BY event_time ASC
+        LIMIT %s
+    """
+    params.append(req.max_points)
+
+    features: List[Dict[str, Any]] = []
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    for row in rows:
+        lon, lat = float(row[0]), float(row[1])
+        event_time = row[11]
+        # Emit naive UTC text so existing /analyze (+8h) behaves like file mode.
+        if hasattr(event_time, "astimezone"):
+            naive_utc = event_time.astimezone(timezone.utc).replace(tzinfo=None)
+            time_text = naive_utc.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            time_text = str(event_time)
+
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {
+                    "id": row[2],
+                    "route_id": row[3],
+                    "route_num": row[4],
+                    "rtype": row[5],
+                    "speed": row[6],
+                    "dir": row[7],
+                    "low_floor": "1" if row[8] else "0" if row[8] is not None else None,
+                    "wifi": "1" if row[9] else "0" if row[9] is not None else None,
+                    "gos_num": row[10],
+                    "time": time_text,
+                },
+            }
+        )
+
+    return {"type": "FeatureCollection", "features": features}
+
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
@@ -180,6 +329,9 @@ async def analyze(req: AnalyzeRequest):
         slow_candidates = []
         slow_indices = []
 
+        analysis_contains = build_analysis_geometry_checker(req.analysis_geometry)
+        route_filter = set(req.routes) if req.routes else None
+
         # Process features
         for feat in features:
             geom = feat.get("geometry")
@@ -197,7 +349,7 @@ async def analyze(req: AnalyzeRequest):
             except (TypeError, ValueError):
                 continue
 
-            if req.analysis_geometry and not point_in_analysis_geometry(lon, lat, req.analysis_geometry):
+            if not analysis_contains(lon, lat):
                 continue
 
             # Parse time and apply +8 hours offset
@@ -214,7 +366,7 @@ async def analyze(req: AnalyzeRequest):
                 continue
             
             # Apply route filter
-            if req.routes and str(props.get("route_num")) not in req.routes:
+            if route_filter and str(props.get("route_num")) not in route_filter:
                 continue
 
             try:
@@ -282,7 +434,7 @@ async def analyze(req: AnalyzeRequest):
             "congestion_index": congestion_index,
             "dropped": dropped,
             "count": len(filtered_points),
-            "filtered_geojson": {"type": "FeatureCollection", "features": filtered_points},
+            "filtered_geojson": {"type": "FeatureCollection", "features": []},
             "congestion_zones": [],
             "plot": {"times": [], "speeds": []},
             "statistics": calculate_statistics(speeds) if speeds else {},
@@ -312,6 +464,15 @@ async def analyze(req: AnalyzeRequest):
             "raw_times": raw_times,
             "raw_speeds": speeds
         }
+
+        render_indices = _downsample_indices(len(filtered_points), req.render_points_limit)
+        result["filtered_geojson"]["features"] = [filtered_points[i] for i in render_indices]
+        if len(filtered_points) > req.render_points_limit:
+            result["warnings"].append(
+                "Карта отображает выборку точек для ускорения интерфейса "
+                f"({req.render_points_limit} из {len(filtered_points)}). "
+                "Статистика и зоны заторов рассчитаны по всем точкам."
+            )
 
         # Clustering
         if slow_candidates:
@@ -355,6 +516,114 @@ async def analyze(req: AnalyzeRequest):
     except Exception as e:
         logger.error(f"Error in analyze: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/db")
+async def analyze_db(req: AnalyzeDbRequest):
+    try:
+        geojson = _build_geojson_from_db(req)
+        bridge_req = AnalyzeRequest(
+            geojson=geojson,
+            # SQL query already applies time filtering in local (Irkutsk) semantics.
+            # Avoid re-filtering in /analyze where +8h offset is applied for file mode.
+            start=None,
+            end=None,
+            include_zero=req.include_zero,
+            speed_thresh=req.speed_thresh,
+            eps_m=req.eps_m,
+            min_pts=req.min_pts,
+            return_all_clusters=req.return_all_clusters,
+            routes=req.routes,
+            map_matching=req.map_matching,
+            snap_tolerance_m=req.snap_tolerance_m,
+            analysis_geometry=req.analysis_geometry,
+            bidirectional_analysis=req.bidirectional_analysis,
+            render_points_limit=req.render_points_limit,
+        )
+        result = await analyze(bridge_req)
+        if len(geojson.get("features", [])) >= req.max_points:
+            result.setdefault("warnings", []).append(
+                f"Достигнут лимит выборки из БД: {req.max_points} точек. Уточните период/фильтры."
+            )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in analyze_db: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/analyze/db/meta")
+async def analyze_db_meta():
+    try:
+        if psycopg is None:
+            raise RuntimeError(
+                "psycopg is not installed in backend interpreter: "
+                f"{sys.executable}. Install with: \"{sys.executable}\" -m pip install psycopg[binary]"
+            )
+
+        dsn = os.getenv("IRKBUS_DB_DSN")
+        if not dsn:
+            raise RuntimeError("IRKBUS_DB_DSN is not configured.")
+
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        MIN(event_time) AS min_time,
+                        MAX(event_time) AS max_time,
+                        COUNT(*) AS points_count
+                    FROM transport.telemetry_snapshot
+                    WHERE event_time IS NOT NULL;
+                    """
+                )
+                row = cur.fetchone()
+                min_time = row[0] if row else None
+                max_time = row[1] if row else None
+                points_count = int(row[2] or 0) if row else 0
+
+                cur.execute(
+                    """
+                    SELECT DISTINCT route_num
+                    FROM transport.telemetry_snapshot
+                    WHERE route_num IS NOT NULL AND route_num <> ''
+                    ORDER BY route_num;
+                    """
+                )
+                routes = [str(r[0]) for r in cur.fetchall()]
+
+        irkutsk_tz = ZoneInfo("Asia/Irkutsk")
+        min_local = _format_local_naive(min_time, irkutsk_tz)
+        max_local = _format_local_naive(max_time, irkutsk_tz)
+
+        return {
+            # Send local-naive datetimes to avoid timezone shifts in browser auto-fill.
+            "min_time": min_local,
+            "max_time": max_local,
+            "points_count": points_count,
+            "routes": routes,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in analyze_db_meta: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _to_utc_for_db(dt: Any, local_tz: ZoneInfo):
+    if getattr(dt, "tzinfo", None) is None:
+        aware_local = dt.replace(tzinfo=local_tz)
+    else:
+        aware_local = dt.astimezone(local_tz)
+    return aware_local.astimezone(timezone.utc)
+
+
+def _format_local_naive(dt: Any, local_tz: ZoneInfo) -> Optional[str]:
+    if dt is None:
+        return None
+    local_dt = dt.astimezone(local_tz)
+    return local_dt.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

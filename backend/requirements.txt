@@ -5,3 +5,6 @@ shapely>=2.0.0
 pyproj
 pydantic
 requests
+psycopg[binary]
+python-dotenv
+orjson

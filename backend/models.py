@@ -27,12 +27,72 @@ class AnalyzeRequest(BaseModel):
         False,
         description="Раздельная статистика по двум направлениям движения внутри полигона (нужен analysis_geometry).",
     )
+    render_points_limit: int = Field(
+        5000,
+        ge=1000,
+        le=200000,
+        description="Maximum number of points returned in filtered_geojson for map rendering (stats still use all points).",
+    )
 
     @validator("geojson")
     def validate_geojson(cls, v):
         if not isinstance(v, dict) or v.get("type") != "FeatureCollection":
             raise ValueError("GeoJSON must be a FeatureCollection")
         return v
+
+    @validator("analysis_geometry")
+    def validate_analysis_geometry(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, dict) or v.get("type") not in ("Polygon", "MultiPolygon"):
+            raise ValueError("analysis_geometry must be a GeoJSON Polygon or MultiPolygon object")
+        return v
+
+
+class ParserStartRequest(BaseModel):
+    use_db: bool = Field(False, description="Enable writing parser output into PostgreSQL/PostGIS")
+    cookie: Optional[str] = Field(
+        None,
+        description="Optional full Cookie header with PHPSESSID and related values",
+    )
+
+
+class AnalyzeDbRequest(BaseModel):
+    start: Optional[str] = Field(None, description="Start datetime filter")
+    end: Optional[str] = Field(None, description="End datetime filter")
+    include_zero: bool = Field(True, description="Include zero speed points")
+    speed_thresh: float = Field(8.0, ge=0, description="Speed threshold for congestion detection (km/h)")
+    eps_m: float = Field(50.0, gt=0, description="Clustering radius in meters")
+    min_pts: int = Field(4, ge=1, description="Minimum points per cluster")
+    return_all_clusters: bool = Field(True, description="Return all congestion clusters, not just the largest")
+    routes: Optional[List[str]] = Field(None, description="List of route numbers to filter by")
+    map_matching: bool = Field(False, description="Включить привязку точек к графу дорожной сети")
+    snap_tolerance_m: float = Field(
+        50.0,
+        gt=0,
+        le=500,
+        description="Допуск привязки к дороге, метры",
+    )
+    analysis_geometry: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Optional GeoJSON geometry (Polygon or MultiPolygon, WGS84). Only points inside are analyzed.",
+    )
+    bidirectional_analysis: bool = Field(
+        False,
+        description="Раздельная статистика по двум направлениям движения внутри полигона (нужен analysis_geometry).",
+    )
+    max_points: int = Field(
+        100000,
+        ge=1000,
+        le=500000,
+        description="Max points to fetch from DB for one analysis request",
+    )
+    render_points_limit: int = Field(
+        5000,
+        ge=1000,
+        le=200000,
+        description="Maximum number of points returned in filtered_geojson for map rendering (stats still use all points).",
+    )
 
     @validator("analysis_geometry")
     def validate_analysis_geometry(cls, v):

@@ -1,11 +1,13 @@
 # backend/utils.py
 import logging
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
-from datetime import datetime
+from datetime import datetime, timezone
+from functools import lru_cache
 from dateutil import parser
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from shapely.geometry import Point, shape
+from shapely.prepared import prep
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,63 @@ def point_in_analysis_geometry(lon: float, lat: float, geom: Optional[Dict[str, 
         return False
 
 
+def build_analysis_geometry_checker(geom: Optional[Dict[str, Any]]) -> Callable[[float, float], bool]:
+    """
+    Build a reusable point-in-geometry predicate to avoid rebuilding geometry
+    for every telemetry point during analysis.
+    """
+    if not geom:
+        return lambda _lon, _lat: True
+
+    gtype = geom.get("type")
+    if gtype not in ("Polygon", "MultiPolygon"):
+        return lambda _lon, _lat: False
+
+    try:
+        g = shape(geom)
+        if not g.is_valid:
+            g = g.buffer(0)
+        prepared = prep(g)
+        return lambda lon, lat: bool(prepared.covers(Point(lon, lat)))
+    except Exception:
+        return lambda _lon, _lat: False
+
+
+@lru_cache(maxsize=200000)
+def _parse_time_cached(value: str) -> Optional[datetime]:
+    text = value.strip()
+    if not text:
+        return None
+
+    # Fast path for ISO-like timestamps from API/DB.
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        dt = datetime.fromisoformat(normalized)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+    except ValueError:
+        pass
+
+    # Common explicit formats used in this project.
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+    ):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+        except ValueError:
+            continue
+
+    try:
+        dt = parser.parse(text, dayfirst=True)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+    except Exception as e:
+        logger.warning(f"Failed to parse time '{text}': {e}")
+        return None
+
+
 def parse_time(s: str) -> Optional[datetime]:
     """
     Parse datetime string with flexible format support.
@@ -77,8 +136,4 @@ def parse_time(s: str) -> Optional[datetime]:
     """
     if not s:
         return None
-    try:
-        return parser.parse(str(s), dayfirst=True)
-    except Exception as e:
-        logger.warning(f"Failed to parse time '{s}': {e}")
-        return None
+    return _parse_time_cached(str(s))

@@ -2,13 +2,17 @@
 import { ref, inject, computed, watch } from 'vue'
 import axios from 'axios'
 import { ChevronLeft, ChevronRight, Upload, Play, Trash2, Download, Activity, Clock } from 'lucide-vue-next'
+import { API_BASE } from '../apiBase.js'
 
 const props = defineProps(['isOpen'])
 const emit = defineEmits(['toggle', 'analysis-complete'])
 
-const API_URL = "http://127.0.0.1:8000/analyze"
+const API_URL = `${API_BASE}/analyze`
+const API_DB_URL = `${API_BASE}/analyze/db`
+const API_DB_META_URL = `${API_BASE}/analyze/db/meta`
 const isLoading = inject('isLoading')
 const analysisAreaGeometry = inject('analysisAreaGeometry')
+const dataSource = ref('file') // file | db
 
 const params = ref({
   start: '',
@@ -21,6 +25,8 @@ const params = ref({
   map_matching: false,
   snap_tolerance_m: 50,
   bidirectional_analysis: false,
+  max_points: 100000,
+  render_points_limit: 3000,
 })
 
 watch(
@@ -34,9 +40,14 @@ const rawGeoJson = ref(null)
 const fileName = ref('')
 const notifications = ref([])
 const availableRoutes = ref([])
+const dbAvailableRoutes = ref([])
+const dbMetaLoading = ref(false)
+const dbPointsCount = ref(0)
 
 /** Границы времени по файлу (после загрузки) */
 const dataTimeBounds = ref(null)
+/** Границы времени по данным из БД */
+const dbTimeBounds = ref(null)
 /** День для слайсера часов (YYYY-MM-DD) */
 const sliceDate = ref('')
 const hourFrom = ref(7)
@@ -47,9 +58,12 @@ const pad2 = (n) => String(n).padStart(2, '0')
 const formatLocal = (d) =>
   `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`
 
+const activeTimeBounds = computed(() => (dataSource.value === 'db' ? dbTimeBounds.value : dataTimeBounds.value))
+const routeOptions = computed(() => (dataSource.value === 'db' ? dbAvailableRoutes.value : availableRoutes.value))
+
 const clampToBounds = (a, b) => {
-  if (!dataTimeBounds.value) return { start: formatLocal(a), end: formatLocal(b) }
-  const { min, max } = dataTimeBounds.value
+  if (!activeTimeBounds.value) return { start: formatLocal(a), end: formatLocal(b) }
+  const { min, max } = activeTimeBounds.value
   const s = new Date(Math.max(a.getTime(), min.getTime()))
   const e = new Date(Math.min(b.getTime(), max.getTime()))
   if (s.getTime() >= e.getTime()) return null
@@ -57,8 +71,8 @@ const clampToBounds = (a, b) => {
 }
 
 const sliceDateBounds = computed(() => {
-  if (!dataTimeBounds.value) return { min: '', max: '' }
-  const { min, max } = dataTimeBounds.value
+  if (!activeTimeBounds.value) return { min: '', max: '' }
+  const { min, max } = activeTimeBounds.value
   const f = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
   return { min: f(min), max: f(max) }
 })
@@ -144,12 +158,63 @@ const detectTimeRange = (geojson) => {
   }
 }
 
+const fetchDbMeta = async () => {
+  try {
+    dbMetaLoading.value = true
+    const res = await axios.get(API_DB_META_URL)
+    const meta = res.data || {}
+
+    dbAvailableRoutes.value = Array.isArray(meta.routes) ? meta.routes : []
+    dbPointsCount.value = Number(meta.points_count || 0)
+
+    if (meta.min_time && meta.max_time) {
+      const min = new Date(meta.min_time)
+      const max = new Date(meta.max_time)
+      if (!isNaN(min.getTime()) && !isNaN(max.getTime())) {
+        dbTimeBounds.value = { min, max }
+        sliceDate.value = `${min.getFullYear()}-${pad2(min.getMonth() + 1)}-${pad2(min.getDate())}`
+        hourFrom.value = min.getHours()
+        hourTo.value = Math.min(23, min.getHours() + 3)
+        params.value.start = formatLocal(min)
+        params.value.end = formatLocal(max)
+      } else {
+        dbTimeBounds.value = null
+      }
+    } else {
+      dbTimeBounds.value = null
+    }
+
+    if (dbPointsCount.value > 0) {
+      addNotification(`БД: ${dbPointsCount.value} точек, маршрутов: ${dbAvailableRoutes.value.length}`, 'info')
+    } else {
+      addNotification('В БД пока нет точек для анализа', 'warning')
+    }
+  } catch (e) {
+    dbTimeBounds.value = null
+    dbAvailableRoutes.value = []
+    dbPointsCount.value = 0
+    addNotification(`Ошибка загрузки метаданных БД: ${e.response?.data?.detail || e.message}`, 'error')
+  } finally {
+    dbMetaLoading.value = false
+  }
+}
+
+watch(
+  () => dataSource.value,
+  async (source) => {
+    params.value.routes = []
+    if (source === 'db') {
+      await fetchDbMeta()
+    }
+  }
+)
+
 const applyPreset = (id) => {
-  if (!dataTimeBounds.value) {
+  if (!activeTimeBounds.value) {
     addNotification('Сначала загрузите файл с метками времени', 'warning')
     return
   }
-  const { min, max } = dataTimeBounds.value
+  const { min, max } = activeTimeBounds.value
   const D = new Date(min.getFullYear(), min.getMonth(), min.getDate(), 0, 0, 0, 0)
 
   const slot = (h0, h1) => {
@@ -203,7 +268,6 @@ const applyHourSlice = () => {
 }
 
 const buildPayload = () => ({
-  geojson: rawGeoJson.value,
   include_zero: params.value.include_zero,
   speed_thresh: params.value.speed_thresh,
   eps_m: params.value.eps_m,
@@ -213,10 +277,12 @@ const buildPayload = () => ({
   snap_tolerance_m: params.value.snap_tolerance_m,
   analysis_geometry: analysisAreaGeometry?.value || null,
   bidirectional_analysis: params.value.bidirectional_analysis,
+  max_points: params.value.max_points,
+  render_points_limit: params.value.render_points_limit,
 })
 
 const runAnalysis = async () => {
-  if (!rawGeoJson.value) {
+  if (dataSource.value === 'file' && !rawGeoJson.value) {
     addNotification("Сначала загрузите GeoJSON", "warning")
     return
   }
@@ -228,11 +294,15 @@ const runAnalysis = async () => {
 
   isLoading.value = true
   try {
-    const res = await axios.post(API_URL, {
+    const payload = {
       ...buildPayload(),
       start: params.value.start.replace('T', ' '),
       end: params.value.end.replace('T', ' '),
-    })
+    }
+    if (dataSource.value === 'file') {
+      payload.geojson = rawGeoJson.value
+    }
+    const res = await axios.post(dataSource.value === 'file' ? API_URL : API_DB_URL, payload)
     emit('analysis-complete', res.data)
     addNotification('Анализ завершён', 'success')
   } catch (e) {
@@ -275,7 +345,7 @@ const exportPdf = () => {
     <div class="p-4 border-b border-gray-100 flex items-center justify-between overflow-hidden whitespace-nowrap">
       <h1 v-if="isOpen" class="font-bold text-lg text-primary-600 flex items-center gap-2">
         <Activity class="w-6 h-6" />
-        тест для проверки
+        Анализ транспорта
       </h1>
       <button 
         @click="emit('toggle')"
@@ -307,14 +377,48 @@ const exportPdf = () => {
 
       <!-- Section: Load Data -->
       <div class="space-y-3">
-        <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Загрузка данных</h2>
-        <label class="group block border-2 border-dashed border-gray-200 hover:border-primary-400 rounded-xl p-6 transition-all cursor-pointer bg-gray-50 hover:bg-white text-center">
+        <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider">Источник данных</h2>
+        <div class="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            @click="dataSource = 'file'"
+            :class="[
+              'text-xs font-semibold py-2 px-3 rounded-lg border transition-colors',
+              dataSource === 'file'
+                ? 'bg-primary-600 text-white border-primary-600'
+                : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'
+            ]"
+          >
+            Из файла
+          </button>
+          <button
+            type="button"
+            @click="dataSource = 'db'"
+            :class="[
+              'text-xs font-semibold py-2 px-3 rounded-lg border transition-colors',
+              dataSource === 'db'
+                ? 'bg-primary-600 text-white border-primary-600'
+                : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50'
+            ]"
+          >
+            Из базы данных
+          </button>
+        </div>
+        <label
+          v-if="dataSource === 'file'"
+          class="group block border-2 border-dashed border-gray-200 hover:border-primary-400 rounded-xl p-6 transition-all cursor-pointer bg-gray-50 hover:bg-white text-center"
+        >
           <Upload class="w-8 h-8 mx-auto mb-3 text-gray-300 group-hover:text-primary-500 transition-colors" />
           <span class="block text-sm font-medium text-gray-600 group-hover:text-primary-600">
             {{ fileName || 'Выберите GeoJSON файл' }}
           </span>
           <input type="file" @change="handleFileUpload" class="hidden" accept=".geojson,.json" />
         </label>
+        <p v-else class="text-[11px] text-gray-500 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+          Анализ будет выполнен по данным из таблицы <code>transport.telemetry_snapshot</code> за выбранный период.
+          <span v-if="dbMetaLoading" class="ml-1 text-primary-600">Загрузка метаданных...</span>
+          <span v-else-if="dbPointsCount > 0" class="ml-1 text-primary-600">Точек в БД: {{ dbPointsCount }}</span>
+        </p>
       </div>
 
       <!-- Section: Map AOI -->
@@ -380,7 +484,7 @@ const exportPdf = () => {
           </div>
         </div>
 
-        <div v-if="dataTimeBounds" class="space-y-2 pt-2 border-t border-gray-100">
+        <div v-if="activeTimeBounds" class="space-y-2 pt-2 border-t border-gray-100">
           <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
             <Clock class="w-3.5 h-3.5" /> Быстрый выбор
           </h2>
@@ -420,10 +524,10 @@ const exportPdf = () => {
           <p class="text-[10px] text-gray-400 leading-snug">Пресеты 6–10, 10–16… — по <strong>первому календарному дню</strong> из файла. «−2 ч» — от конца данных.</p>
         </div>
 
-        <div v-if="availableRoutes.length > 0" class="space-y-1">
+        <div v-if="routeOptions.length > 0" class="space-y-1">
           <label class="text-xs text-gray-500">Маршруты (не выбрано = все)</label>
           <div class="h-24 overflow-y-auto border border-gray-200 rounded-md p-2 bg-gray-50 custom-scrollbar grid grid-cols-2 gap-1">
-            <label v-for="r in availableRoutes" :key="r" class="flex items-center gap-2 p-1 bg-white hover:bg-primary-50 border border-gray-100 rounded cursor-pointer transition-colors">
+            <label v-for="r in routeOptions" :key="r" class="flex items-center gap-2 p-1 bg-white hover:bg-primary-50 border border-gray-100 rounded cursor-pointer transition-colors">
               <input type="checkbox" :value="r" v-model="params.routes" class="w-3 h-3 text-primary-600 rounded" />
               <span class="text-xs font-semibold text-gray-700">{{ r }}</span>
             </label>
@@ -484,6 +588,32 @@ const exportPdf = () => {
               <span class="text-xs font-medium">{{ params.eps_m }}</span>
             </div>
             <input type="range" min="10" max="200" step="10" v-model="params.eps_m" class="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600" />
+          </div>
+
+          <div v-if="dataSource === 'db'" class="space-y-1">
+            <div class="flex justify-between">
+              <label class="text-xs text-gray-500">Лимит точек из БД</label>
+              <span class="text-xs font-medium">{{ params.max_points }}</span>
+            </div>
+            <input type="range" min="10000" max="300000" step="10000" v-model="params.max_points" class="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600" />
+          </div>
+
+          <div class="space-y-1">
+            <div class="flex justify-between">
+              <label class="text-xs text-gray-500">Точек на карту</label>
+              <span class="text-xs font-medium">{{ params.render_points_limit }}</span>
+            </div>
+            <input
+              type="range"
+              min="1000"
+              max="30000"
+              step="1000"
+              v-model="params.render_points_limit"
+              class="w-full h-1.5 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-primary-600"
+            />
+            <p class="text-[10px] text-gray-400 leading-snug">
+              Влияет только на плавность карты. Статистика считается по всем отфильтрованным точкам.
+            </p>
           </div>
         </div>
       </div>

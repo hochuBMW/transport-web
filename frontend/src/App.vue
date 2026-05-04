@@ -1,13 +1,14 @@
 <script setup>
-import { ref, provide } from 'vue'
+import { ref, shallowRef, provide } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import MainMap from './components/MainMap.vue'
 import ChartSection from './components/ChartSection.vue'
-import StatsPanel from './components/StatsPanel.vue'
+import ParserTab from './components/ParserTab.vue'
 
 const isSidebarOpen = ref(true)
-const analysisResult = ref(null)
+const analysisResult = shallowRef(null)
 const isLoading = ref(false)
+const activeTab = ref('analysis')
 /** GeoJSON Polygon | MultiPolygon | null — область анализа на карте (WGS84) */
 const analysisAreaGeometry = ref(null)
 
@@ -22,6 +23,10 @@ const toggleSidebar = () => {
 
 const handleAnalysisComplete = (data) => {
   analysisResult.value = data
+}
+
+const setTab = (tab) => {
+  activeTab.value = tab
 }
 
 const chartHeight = ref(320)
@@ -54,41 +59,68 @@ const stopResize = () => {
 </script>
 
 <template>
-  <div class="flex h-screen bg-gray-100 overflow-hidden font-sans">
-    <!-- Sidebar -->
-    <Sidebar 
-      :isOpen="isSidebarOpen" 
-      @toggle="toggleSidebar"
-      @analysis-complete="handleAnalysisComplete"
-    />
-
-    <!-- Main Content Area -->
-    <main 
-      class="flex-1 flex flex-col relative transition-all duration-300 ease-in-out overflow-hidden h-screen"
-    >
-      <!-- Map Area -->
-      <div class="grow relative min-h-0 bg-gray-100 flex flex-col">
-        <MainMap :data="analysisResult" :height="chartHeight" class="flex-1" />
-      </div>
-
-      <!-- Resizer Handle -->
-      <div 
-        v-if="analysisResult"
-        @mousedown="startResize"
-        class="h-1.5 w-full bg-gray-200 hover:bg-primary-500 cursor-row-resize transition-colors z-[1001] flex items-center justify-center group"
+  <div class="flex flex-col h-screen bg-gray-100 overflow-hidden font-sans">
+    <header class="h-14 bg-white border-b border-gray-200 flex items-center px-4 gap-2">
+      <button
+        @click="setTab('analysis')"
+        :class="[
+          'px-4 py-2 rounded-lg text-sm font-semibold transition-colors',
+          activeTab === 'analysis' ? 'bg-primary-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+        ]"
       >
-        <div class="w-12 h-1 bg-gray-400 group-hover:bg-white rounded-full opacity-50 group-hover:opacity-100 transition-all"></div>
-      </div>
-
-      <!-- Bottom Chart & Stats Section -->
-      <div 
-        v-if="analysisResult" 
-        :style="{ height: chartHeight + 'px' }"
-        class="flex-shrink-0 bg-white border-t border-gray-100 p-4 relative"
+        Анализ
+      </button>
+      <button
+        @click="setTab('parser')"
+        :class="[
+          'px-4 py-2 rounded-lg text-sm font-semibold transition-colors',
+          activeTab === 'parser' ? 'bg-primary-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+        ]"
       >
-        <ChartSection :data="analysisResult" />
-      </div>
-    </main>
+        Парсер
+      </button>
+    </header>
+
+    <div v-if="activeTab === 'analysis'" class="flex flex-1 overflow-hidden">
+      <!-- Sidebar -->
+      <Sidebar 
+        :isOpen="isSidebarOpen" 
+        @toggle="toggleSidebar"
+        @analysis-complete="handleAnalysisComplete"
+      />
+
+      <!-- Main Content Area -->
+      <main 
+        class="flex-1 flex flex-col relative transition-all duration-300 ease-in-out overflow-hidden h-full"
+      >
+        <!-- Map Area -->
+        <div class="grow relative min-h-0 bg-gray-100 flex flex-col">
+          <MainMap :data="analysisResult" :height="chartHeight" class="flex-1" />
+        </div>
+
+        <!-- Resizer Handle -->
+        <div 
+          v-if="analysisResult"
+          @mousedown="startResize"
+          class="h-1.5 w-full bg-gray-200 hover:bg-primary-500 cursor-row-resize transition-colors z-[1001] flex items-center justify-center group"
+        >
+          <div class="w-12 h-1 bg-gray-400 group-hover:bg-white rounded-full opacity-50 group-hover:opacity-100 transition-all"></div>
+        </div>
+
+        <!-- Bottom Chart & Stats Section -->
+        <div 
+          v-if="analysisResult" 
+          :style="{ height: chartHeight + 'px' }"
+          class="flex-shrink-0 bg-white border-t border-gray-100 p-4 relative"
+        >
+          <ChartSection :data="analysisResult" />
+        </div>
+      </main>
+    </div>
+
+    <div v-else class="flex-1 overflow-hidden">
+      <ParserTab />
+    </div>
   </div>
 </template>
 

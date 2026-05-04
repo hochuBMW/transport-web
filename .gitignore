@@ -1,0 +1,27 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Local environment
+backend/.env
+.env
+.env.*
+!.env.example
+!backend/.env.example
+
+# Runtime data and logs
+data/
+*.log
+
+# Dependencies/build output
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# IDE/system
+.idea/
+.vscode/
+.DS_Store
+
+# Legacy scratch workspace
+ParserIrkBusToQGIS-master/
